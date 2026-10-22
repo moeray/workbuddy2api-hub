@@ -182,9 +182,13 @@ def detect_model_realm(model_id):
     intl_only = {
         "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
         "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash",
-        "grok-4.7"
+        # PATCHED-BY-OPS: kimi-k3 is intl-only (cn carries kimi-k3-1), and any
+        # "-sg" id is the Singapore node of an intl family. Missing these sent
+        # a cn account upstream, which answers 11102 "service info not found".
+        "grok-4.7", "kimi-k3"
     }
-    if m in intl_only or any(m.startswith(p) for p in ("gpt-", "gemini-")):
+    if (m in intl_only or any(m.startswith(p) for p in ("gpt-", "gemini-"))
+            or m.endswith("-sg")):
         return "intl"
     cn_only = {
         "deepseek-v4-pro", "minimax-m3", "minimax-m2.7", "minimax-m2.5",
@@ -207,8 +211,8 @@ CN_EXCLUSIVE_PREFIXES = ("minimax-", "deepseek-v4-pro")
 INTL_EXCLUSIVE = {
     "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash",
-    "grok-4.7",
-}
+    "grok-4.7", "kimi-k3",
+    }
 CN_EXCLUSIVE = {
     "deepseek-v4-pro", "glm-5.1", "glm-5v-turbo",
     "kimi-k3-1", "kimi-k2.7", "minimax-m3",
@@ -219,7 +223,8 @@ def exclusive_realm(model_id):
     if not model_id:
         return ""
     m = str(model_id).lower()
-    if m in INTL_EXCLUSIVE or m.startswith(INTL_EXCLUSIVE_PREFIXES):
+    if (m in INTL_EXCLUSIVE or m.startswith(INTL_EXCLUSIVE_PREFIXES)
+            or m.endswith("-sg")):
         return "intl"
     if m in CN_EXCLUSIVE or m.startswith(CN_EXCLUSIVE_PREFIXES):
         return "cn"
@@ -13489,6 +13494,174 @@ def _free_model_credit_fallback_enabled():
         "1", "true", "yes", "on")
 
 
+# ---------------------------------------------------------------------------
+# PATCHED-BY-OPS: cross-exit failover + hold-on-exhaustion
+#
+# Upstream behaviour this works around: a request is pinned to one exit
+# (target_realm / detect_model_realm / CURRENT_REALM) and, once every account on
+# that exit is parked by a 429/402, open_upstream gives up and the client gets a
+# hard error. The task is then lost even though the other exit - or the same
+# exit a minute later - would have served it.
+#
+# (a) When the pinned exit has nothing usable, borrow ONE account from the other
+#     exit for this request only. CURRENT_REALM / active_realm.json are left
+#     untouched, so the panel keeps reporting the exit the operator chose.
+# (b) When both exits are exhausted, hold the request open and re-poll instead
+#     of answering 429 immediately, so a short quota/rate window is ridden out.
+#
+# Toggles (env, all optional):
+#   WB_CROSS_REALM_FAILOVER=0   disable borrowing the other exit
+#   WB_HOLD_ON_NO_ACCOUNT=0     disable holding (restores old fail-fast)
+#   WB_HOLD_MAX_SECONDS=300     longest a request may be held
+#   WB_HOLD_POLL_SECONDS=15     re-poll interval while holding
+# ---------------------------------------------------------------------------
+CROSS_REALM_FAILOVER = os.environ.get("WB_CROSS_REALM_FAILOVER", "1").strip().lower() not in (
+    "0", "false", "off", "no")
+HOLD_ON_NO_ACCOUNT = os.environ.get("WB_HOLD_ON_NO_ACCOUNT", "1").strip().lower() not in (
+    "0", "false", "off", "no")
+# Route a single-exit model to its own exit even when the panel chose the other
+# one. Off = keep the old "wrong key for this model" 400.
+MODEL_REALM_ROUTING = os.environ.get("WB_MODEL_REALM_ROUTING", "1").strip().lower() not in (
+    "0", "false", "off", "no")
+try:
+    HOLD_MAX_SECONDS = max(0.0, float(os.environ.get("WB_HOLD_MAX_SECONDS", "300")))
+except (TypeError, ValueError):
+    HOLD_MAX_SECONDS = 300.0
+try:
+    HOLD_POLL_SECONDS = max(5.0, float(os.environ.get("WB_HOLD_POLL_SECONDS", "15")))
+except (TypeError, ValueError):
+    HOLD_POLL_SECONDS = 15.0
+
+
+def _alternate_realm(realm):
+    return "intl" if realm == "cn" else "cn"
+
+
+# Model families served by ONE exit only. Kept in sync with the sets inside
+# detect_model_realm(); borrowing a credential from the other exit for one of
+# these would just earn a 400 "model not found" from upstream, which is a worse
+# client experience than the 429 it replaces.
+_INTL_ONLY_MODELS = {
+    "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash", "grok-4.7",
+    "kimi-k3",
+    }
+_CN_ONLY_MODELS = {
+    "deepseek-v4-pro", "minimax-m3", "minimax-m2.7", "minimax-m2.5",
+    "glm-5.1", "glm-5.0-turbo", "glm-4.6v",
+    "kimi-k3-1", "kimi-k2.7", "kimi-k2-thinking",
+    "hy3-x", "hy4-preview-dev", "hy4-preview-x",
+}
+
+
+def model_realm_exclusive(model):
+    """True when `model` is served by one exit only (cross-exit borrow is useless)."""
+    m = str(model or "").lower()
+    if not m:
+        return False
+    return (m in _INTL_ONLY_MODELS or m.startswith(("gpt-", "gemini-"))
+            or m.endswith("-sg")
+            or m in _CN_ONLY_MODELS or m.startswith(("minimax-", "deepseek-v4-pro")))
+
+
+def pick_account_both_exits(realm, session_key=None, exclude=None, model=None, page=None,
+                            allow_cross=True):
+    """Pick an account from `realm`, falling back to the other exit.
+
+    The fallback borrows one credential for this request and leaves the global
+    exit alone, so accounting and the panel stay consistent with the operator's
+    choice. `allow_cross=False` pins the request to its own exit: used for
+    realm-bound API keys (the operator named the exit) and for models served by
+    one exit only, where borrowing would earn a 400 instead of a 429.
+    """
+    if POOL is None:
+        return None
+    account = POOL.pick_for_session(realm=realm, session_key=session_key,
+                                    exclude=exclude, model=model, page=page)
+    if account is None and CROSS_REALM_FAILOVER and allow_cross:
+        alt = _alternate_realm(realm)
+        if restriction_hold_remaining(alt) <= 0:
+            account = POOL.pick_for_session(realm=alt, session_key=session_key,
+                                            exclude=exclude, model=model, page=page)
+            if account is not None:
+                log("cross-exit failover: %s has no usable account, borrowing %s "
+                    "account %s for this request"
+                    % (realm, alt, account.uid[:8]))
+    return account
+
+
+def _blocked_beyond(model, horizon=300.0):
+    """True when every account is blocked in a way that will not lift soon.
+
+    Three kinds of block count as "not soon": a quota cap whose reset is hours
+    away, a model disabled by hand on the panel, and an upstream restriction
+    hold. A plain rate limit (no cap recorded) usually clears in seconds, so
+    holding is the right move there - returning False keeps that behaviour.
+
+    Holding only helps when a block is ABOUT to expire; holding on a block that
+    lasts hours just delays the caller's failover by the whole hold window.
+    """
+    if POOL is None:
+        return False
+    now = time.time()
+    seen = False
+    for account in getattr(POOL, "accounts", ()):
+        seen = True
+        try:
+            if account.cap_until(model, now) > now + horizon:
+                continue
+            if account.model_disabled(model):
+                continue
+            if (getattr(account, "restricted_until", 0) or 0) > now + horizon:
+                continue
+        except Exception:
+            return False
+        # Something could come back within the horizon: holding is justified.
+        return False
+    return seen
+
+
+def hold_for_available_account(realm, session_key=None, exclude=None, model=None, page=None,
+                               allow_cross=True):
+    """Block until either exit has a usable account again, or the hold expires.
+
+    Only called when both exits are exhausted (every credential parked by a
+    quota/rate window). Returning an account lets the caller carry on as if
+    nothing happened; None restores the old behaviour (the caller raises the
+    original 429).
+    """
+    if not HOLD_ON_NO_ACCOUNT or POOL is None or HOLD_MAX_SECONDS <= 0:
+        return None
+    if _blocked_beyond(model):
+        # PATCHED-BY-OPS: the block (quota reset hours away, model disabled by
+        # hand, or an upstream restriction hold) will not lift soon. Holding
+        # cannot help, and it would block the caller from failing over (the
+        # aggregator switches to Notion only after it sees a 429).
+        log("both exits are blocked for '%s' beyond the hold horizon; failing "
+            "fast so the caller can fail over instead of holding" % model)
+        return None
+    deadline = time.time() + HOLD_MAX_SECONDS
+    waited = 0.0
+    announced = False
+    while time.time() < deadline:
+        if not announced:
+            log("both exits exhausted for '%s'; holding the request up to %ds "
+                "instead of answering 429" % (model, int(HOLD_MAX_SECONDS)))
+            announced = True
+        time.sleep(HOLD_POLL_SECONDS)
+        waited += HOLD_POLL_SECONDS
+        if exclude is not None:
+            exclude.clear()
+        account = pick_account_both_exits(realm, session_key=session_key,
+                                          exclude=exclude, model=model, page=page)
+        if account is not None:
+            log("account %s became available after %.0fs hold"
+                % (account.uid[:8], waited))
+            return account
+    log("hold expired after %.0fs with no usable account" % waited)
+    return None
+
+
 def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=None,
                   allow_credit_fallback=True, allow_product_switch=True):
     # Refresh the daily guards before picking. The scan underneath is
@@ -13520,6 +13693,18 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # 连坐保护：同一区域刚有账号被上游风控限制，整池暂停派发。这里直接快速
     # 失败、一个上游请求都不发——继续打只会把同一台设备上的其他账号也送走。
     hold = restriction_hold_remaining(realm)
+    if (hold > 0 and CROSS_REALM_FAILOVER and target_realm is None
+            and POOL is not None and not model_realm_exclusive(model)):
+        # PATCHED-BY-OPS: an upstream restriction is account/device scoped, so
+        # the other exit is the only useful move. Serve this request from there
+        # instead of failing fast; the global exit is left untouched.
+        alt = _alternate_realm(realm)
+        if (restriction_hold_remaining(alt) <= 0
+                and POOL.count_ready(alt, model=model) > 0):
+            log("cross-exit failover: %s is under a restriction hold, serving "
+                "this request from %s" % (realm, alt))
+            realm = alt
+            hold = 0.0
     if hold > 0:
         raise RateLimited(None, "upstream account restriction in effect",
                           wait=int(hold) + 1,
@@ -13548,6 +13733,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     total = (1 if pinned is not None else
              (max(1, POOL.count_ready(realm, model=model)) if POOL else 1))
     tried = set()
+    # PATCHED-BY-OPS: hold at most once per request. Re-entering the loop after
+    # a held account fails must not stack another full hold window.
+    held_once = False
+    # PATCHED-BY-OPS: borrowing the other exit is only meaningful when the
+    # operator did not pin one and the model is served by both exits.
+    cross_ok = (CROSS_REALM_FAILOVER and target_realm is None
+                and not model_realm_exclusive(model))
     # 这一轮请求已经记过账的账号：重试轮（transient_hits 后 tried.clear() 整池
     # 重轮）会把同一个账号再挑一遍，若每次都记，一次请求就能给同一个账号记上
     # 好几笔 fails/degrade——池子越空、重轮越频繁，越容易把一个刚抖了一下的
@@ -13633,9 +13825,20 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             account = pool_account(refresh_uid)
             refresh_uid = None
         else:
-            account = POOL.pick_for_session(realm=realm, session_key=session_key,
-                                            exclude=tried, model=model,
-                                            page=affinity_page) if POOL else None
+            # PATCHED-BY-OPS: borrow from the other exit when this one is empty.
+            account = pick_account_both_exits(realm, session_key=session_key,
+                                              exclude=tried, model=model,
+                                              page=affinity_page,
+                                              allow_cross=cross_ok)
+        if account is None and not held_once and pinned is None:
+            # PATCHED-BY-OPS: both exits exhausted -> hold instead of answering
+            # 429 straight away; the client waits on an open request. Skipped
+            # for a pinned account, where the operator asked for that uid.
+            held_once = True
+            account = hold_for_available_account(realm, session_key=session_key,
+                                                 exclude=tried, model=model,
+                                                 page=affinity_page,
+                                                 allow_cross=cross_ok)
         if account is None:
             if transient_hits and _attempt < max_attempts - 1:
                 tried.clear()
@@ -13643,8 +13846,11 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 continue
             break
         if account.realm != realm:
-            if session_key and POOL: POOL.affinity.demote(session_key, account.uid)
-            continue
+            # PATCHED-BY-OPS: a borrowed cross-exit account is served with its
+            # own realm config below (chat_base_url / get_realm_config both read
+            # account.realm), so it is no longer skipped.
+            log("cross-exit: serving %s request with %s account %s"
+                % (realm, account.realm, account.uid[:8]))
         tried.add(account.uid)
         last_uid = account.uid
         cfg = wb_accounts.get_realm_config(account.realm)
@@ -13756,7 +13962,16 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     # 429 即使带重置墙钟也不构成额度判定，不记 cap、不写盘。
                     # 记录范围（免费模型）由 note_model_cap 把守——范围外的
                     # 模型返回 False，重启后自动放开，不参与持久化禁用。
-                    if rate_limit_is_cap(detail):
+                    #
+                    # PATCHED-BY-OPS: 上游给了「明确的恢复时刻」且距今超过 5
+                    # 分钟时，也按该模型上限停用这个账号。依据是观测到的实际
+                    # 损耗：账号 acf5bff3 在 ds4-flash 上额度耗尽后，因为 429
+                    # 不是 6004 形态，只拿到 60s 冷却，于是每次请求都先试它、
+                    # 撞一次 429、再切走（2 分钟内 3 次），每请求白付一次往返。
+                    # reset_at 是上游自己声明的恢复时间，按它停用不会过度；
+                    # 5 分钟以内的短时频率限制仍走原来的冷却，不写盘。
+                    long_window = reset_at - time.time() > 300
+                    if rate_limit_is_cap(detail) or long_window:
                         try:
                             if account.note_model_cap(model, reset_at):
                                 _save_account_caps(account, model, reset_at)
@@ -19802,6 +20017,14 @@ class Handler(BaseHTTPRequestHandler):
         )
         try:
             req_realm = self._request_realm() or CURRENT_REALM
+            # PATCHED-BY-OPS: route a single-exit model to its own exit even
+            # when the panel chose the other one, unless the key pinned an exit.
+            if MODEL_REALM_ROUTING and not self._request_realm():
+                _owner = exclusive_realm(chat_req.get("model"))
+                if _owner and _owner != req_realm:
+                    log("model %s is %s-only; auto-routing this request to %s"
+                        % (chat_req.get("model"), _owner, _owner))
+                    req_realm = _owner
             blocked = self._cross_realm_error(chat_req.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -20034,6 +20257,13 @@ class Handler(BaseHTTPRequestHandler):
                key_label(self._key_id()) or "-"))
         try:
             req_realm = self._request_realm() or CURRENT_REALM
+            # PATCHED-BY-OPS: same auto-routing as the chat path (see above).
+            if MODEL_REALM_ROUTING and not self._request_realm():
+                _owner = exclusive_realm(chat_req.get("model"))
+                if _owner and _owner != req_realm:
+                    log("model %s is %s-only; auto-routing this request to %s"
+                        % (chat_req.get("model"), _owner, _owner))
+                    req_realm = _owner
             blocked = self._cross_realm_error(chat_req.get("model"), req_realm)
             if blocked:
                 return self._anthropic_error(400, blocked, "invalid_request_error")
@@ -20398,6 +20628,13 @@ class Handler(BaseHTTPRequestHandler):
         t_start = time.time()
         try:
             req_realm = self._request_realm() or CURRENT_REALM
+            # PATCHED-BY-OPS: same auto-routing as the responses path.
+            if MODEL_REALM_ROUTING and not self._request_realm():
+                _owner = exclusive_realm(payload.get("model"))
+                if _owner and _owner != req_realm:
+                    log("model %s is %s-only; auto-routing this request to %s"
+                        % (payload.get("model"), _owner, _owner))
+                    req_realm = _owner
             blocked = self._cross_realm_error(payload.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")

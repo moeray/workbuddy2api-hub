@@ -23,6 +23,8 @@ if "%PORT%"=="" set "PORT=8788"
 set "HERE=%~dp0"
 set "SCRIPT=%HERE%wb_proxy.py"
 set "PYARGS=--port %PORT%"
+rem PATCHED-BY-OPS: keep the hold short so the aggregator can fail over to Notion
+set "WB_HOLD_MAX_SECONDS=20"
 
 if not exist "%SCRIPT%" goto no_script
 
@@ -80,7 +82,11 @@ goto viewer_go
 
 :viewer_go
 if not exist "%HERE%console_tail.py" exit /b 0
-start "" "%VIEWERPY%" "%HERE%console_tail.py" --port %PORT%
+rem PATCHED-BY-OPS: live viewer disabled - it left one stray console_tail.py
+rem per gateway restart (4 had piled up). Use the panel log view instead.
+rem To re-enable: delete these rem lines and the "exit /b 0" above this block.
+if not exist "%HERE%console_tail.py" exit /b 0
+exit /b 0
 exit /b 0
 
 :use_python
