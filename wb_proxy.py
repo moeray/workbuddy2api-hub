@@ -14726,10 +14726,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                                                   allow_cross=cross_ok)
                 if account is not None and not account_slot_acquire(account):
                     account = None
-            if account is None and not held_once and pinned is None:
+            if account is None and not held_once and pinned is None and cross_ok:
                 # PATCHED-BY-OPS: both exits exhausted -> hold instead of
-                # answering 429 straight away. Skipped for a pinned account,
-                # where the operator asked for that uid.
+                # answering 429 straight away. Skipped for a pinned account
+                # (the operator asked for that uid) and for single-exit models:
+                # borrowing is impossible there, so the loop only spins until
+                # the timeout (measured: gpt-6-astra 0.2s -> 30s).
                 held_once = True
                 account = hold_for_available_account(realm, session_key=session_key,
                                                      exclude=tried, model=model,
