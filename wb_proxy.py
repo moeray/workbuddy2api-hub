@@ -259,6 +259,17 @@ CN_EXCLUSIVE = {
     "minimax-m2.7",
     "minimax-m3",
 }
+# PATCHED-BY-OPS: model -> exit where the same id costs fewer credits.
+# Verified against product-config-{cn,intl}.json:
+#   cn   deepseek-v4.1-flash     x0.11
+#   intl deepseek-v4.1-flash     x0.00  (free)
+#   intl deepseek-v4.1-flash-sg  x0.03
+# Only applied when that exit has a ready account, so it cannot reduce
+# availability - it just avoids paying for the same tokens.
+CHEAPER_REALM = {
+    "deepseek-v4.1-flash": "intl",
+}
+
 def exclusive_realm(model_id):
     """"intl"/"cn" when only that exit serves the model, else ""."""
     if not model_id:
@@ -14529,6 +14540,28 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 % (pinned_ref(), pinned.unavailable_reason(model)), pinned.uid)
     # 连坐保护：同一区域刚有账号被上游风控限制，整池暂停派发。这里直接快速
     # 失败、一个上游请求都不发——继续打只会把同一台设备上的其他账号也送走。
+    # PATCHED-BY-OPS: prefer the exit where this model is free/cheaper.
+    #
+    # Callers always pass target_realm, so "target_realm is None" can never be
+    # the gate. Instead: only switch when the realm in play is the *default*
+    # one - an operator pinning an exit yields a different realm and is left
+    # alone. Availability is checked first, so this can never turn a working
+    # request into "no usable account".
+    _cheap = CHEAPER_REALM.get(str(model or "").lower())
+    if _cheap and _cheap != realm and realm == CURRENT_REALM and POOL is not None:
+        try:
+            ready = POOL.count_ready(_cheap, model=model)
+        except Exception as exc:  # noqa: BLE001
+            log("cheaper-exit probe failed for %s: %s: %s"
+                % (model, type(exc).__name__, exc))
+            ready = 0
+        if ready > 0:
+            log("model %s costs less on %s (free); preferring that exit "
+                "(%d ready account(s))" % (model, _cheap, ready))
+            realm = _cheap
+        else:
+            log("model %s is cheaper on %s but that exit has no ready account; "
+                "staying on %s" % (model, _cheap, realm))
     hold = restriction_hold_remaining(realm)
     if (hold > 0 and CROSS_REALM_FAILOVER and target_realm is None
             and POOL is not None and not model_realm_exclusive(model)):
