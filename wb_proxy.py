@@ -193,24 +193,12 @@ def detect_model_realm(model_id):
     if not model_id:
         return CURRENT_REALM
     m = str(model_id).lower()
-    intl_only = {
-        "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-        "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash",
-        # PATCHED-BY-OPS: kimi-k3 is intl-only (cn carries kimi-k3-1), and any
-        # "-sg" id is the Singapore node of an intl family. Missing these sent
-        # a cn account upstream, which answers 11102 "service info not found".
-        "grok-4.7", "kimi-k3"
-    }
-    if (m in intl_only or any(m.startswith(p) for p in ("gpt-", "gemini-"))
+    # PATCHED-BY-OPS: single source of truth. These sets are read at call time,
+    # and both are defined further down the module, so the lookup is safe.
+    if (m in INTL_EXCLUSIVE or any(m.startswith(p) for p in INTL_EXCLUSIVE_PREFIXES)
             or m.endswith("-sg")):
         return "intl"
-    cn_only = {
-        "deepseek-v4-pro", "minimax-m3", "minimax-m2.7", "minimax-m2.5",
-        "glm-5.1", "glm-5.0-turbo", "glm-4.6v",
-        "kimi-k3-1", "kimi-k2.7", "kimi-k2-thinking",
-        "hy3-x", "hy4-preview-dev", "hy4-preview-x"
-    }
-    if m in cn_only or any(m.startswith(p) for p in ("minimax-", "deepseek-v4-pro")):
+    if m in CN_EXCLUSIVE or any(m.startswith(p) for p in CN_EXCLUSIVE_PREFIXES):
         return "cn"
     return CURRENT_REALM
 # glm-5.3-flash was listed as cn-only, but the international exit serves it:
@@ -223,14 +211,53 @@ def detect_model_realm(model_id):
 INTL_EXCLUSIVE_PREFIXES = ("gpt-", "gemini-")
 CN_EXCLUSIVE_PREFIXES = ("minimax-", "deepseek-v4-pro")
 INTL_EXCLUSIVE = {
-    "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-    "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash",
-    "grok-4.7", "kimi-k3",
-    }
+    # computed from product-config-cn/intl diff: intl-only models
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.3-codex",
+    "gemini-3.5-flash",
+    "gemini-3.8-flash",
+    "grok-4.7",
+    "kimi-k3",
+}
 CN_EXCLUSIVE = {
-    "deepseek-v4-pro", "glm-5.1", "glm-5v-turbo",
-    "kimi-k3-1", "kimi-k2.7", "minimax-m3",
-    "hy3-x", "hy4-preview-dev", "hy4-preview-x",
+    # computed from product-config-cn/intl diff: cn-only models
+    "deepseek-r1-0528",
+    "deepseek-v3-0324",
+    "deepseek-v3-1",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "glm-4.6",
+    "glm-4.6v",
+    "glm-5.0-turbo",
+    "glm-5.1",
+    "glm-5v-turbo",
+    "hunyuan-2.0-instruct",
+    "hunyuan-3b",
+    "hunyuan-7b-dense",
+    "hunyuan-chat",
+    "hy3-b",
+    "hy3-c",
+    "hy3-x",
+    "hy4-preview-ctrl",
+    "hy4-preview-dev",
+    "hy4-preview-exp",
+    "hy4-preview-x",
+    "kimi-k2-thinking",
+    "kimi-k2.5",
+    "kimi-k2.7",
+    "kimi-k3-1",
+    "mimo-v2.6-pro",
+    "minimax-m2.5",
+    "minimax-m2.7",
+    "minimax-m3",
 }
 def exclusive_realm(model_id):
     """"intl"/"cn" when only that exit serves the model, else ""."""
@@ -14350,17 +14377,8 @@ def _alternate_realm(realm):
 # detect_model_realm(); borrowing a credential from the other exit for one of
 # these would just earn a 400 "model not found" from upstream, which is a worse
 # client experience than the 429 it replaces.
-_INTL_ONLY_MODELS = {
-    "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-    "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash", "grok-4.7",
-    "kimi-k3",
-    }
-_CN_ONLY_MODELS = {
-    "deepseek-v4-pro", "minimax-m3", "minimax-m2.7", "minimax-m2.5",
-    "glm-5.1", "glm-5.0-turbo", "glm-4.6v",
-    "kimi-k3-1", "kimi-k2.7", "kimi-k2-thinking",
-    "hy3-x", "hy4-preview-dev", "hy4-preview-x",
-}
+_INTL_ONLY_MODELS = set(INTL_EXCLUSIVE)
+_CN_ONLY_MODELS = set(CN_EXCLUSIVE)
 
 
 def model_realm_exclusive(model):
