@@ -14461,8 +14461,12 @@ def hold_for_available_account(realm, session_key=None, exclude=None, model=None
         waited += HOLD_POLL_SECONDS
         if exclude is not None:
             exclude.clear()
+        # PATCHED-BY-OPS: respect the caller's pin. A single-exit model must not
+        # borrow from the other exit here either, or the hold "succeeds" with a
+        # credential that answers 11102 for this model.
         account = pick_account_both_exits(realm, session_key=session_key,
-                                          exclude=exclude, model=model, page=page)
+                                          exclude=exclude, model=model, page=page,
+                                          allow_cross=allow_cross)
         if account is not None:
             log("account %s became available after %.0fs hold"
                 % (account.uid[:8], waited))
