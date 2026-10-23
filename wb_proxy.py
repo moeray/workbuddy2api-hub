@@ -13156,6 +13156,66 @@ def apply_prompt_mode(messages):
     return messages
 
 
+# PATCHED-BY-OPS: last-resort prompt trimming.
+#
+# Codex compacts based on the previous turn's reported usage, so one turn that
+# appends a large apply_patch (its `arguments` are not covered by
+# truncation_policy) can jump from 53万 straight to 110万 tokens and hit the
+# upstream 1048576 ceiling - which kills the session instead of compacting it.
+#
+# Before sending, estimate the body and drop the oldest exchanges until it fits.
+# The cut is only ever placed right before a `user` message, so an assistant
+# tool_calls message is never separated from its tool results.
+MAX_PROMPT_TOKENS = int(os.environ.get("WB_MAX_PROMPT_TOKENS", "900000"))
+_TRIM_BYTES_PER_TOKEN = 3.0
+
+
+def estimate_prompt_tokens(messages):
+    """Rough token estimate from the serialised size.
+
+    Chinese text is ~1 token per 1.5-2 bytes after JSON escaping; ASCII is
+    ~4 bytes per token. 3.0 is deliberately conservative (over-estimates), so
+    the guard errs toward trimming early rather than sending an oversized body.
+    """
+    try:
+        raw = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return 0
+    return int(len(raw.encode("utf-8")) / _TRIM_BYTES_PER_TOKEN)
+
+
+def trim_oversized_history(messages, max_tokens=None):
+    """Return (messages, dropped_exchanges, estimated_tokens).
+
+    Drops the oldest prefix, keeping the system message and cutting at a user
+    boundary. Returns the original list when it already fits or when even the
+    newest user turn is too large (nothing safe to remove).
+    """
+    budget = max_tokens or MAX_PROMPT_TOKENS
+    estimated = estimate_prompt_tokens(messages)
+    if estimated <= budget or len(messages) <= 2:
+        return messages, 0, estimated
+
+    head = messages[:1] if (messages and messages[0].get("role") == "system") else []
+    start = 1 if head else 0
+
+    best = None
+    for i in range(start, len(messages)):
+        if messages[i].get("role") != "user":
+            continue
+        trial = head + messages[i:]
+        if estimate_prompt_tokens(trial) <= budget:
+            best = i
+            break
+
+    if best is None:
+        # Even the newest user turn is oversized; nothing safe to cut.
+        return messages, 0, estimated
+
+    trimmed = head + messages[best:]
+    return trimmed, len(messages) - len(trimmed), estimated
+
+
 def build_upstream_body(payload):
     model = payload.get("model") or ""
     # Map an unsupported level before anything below reads the effort, so the
@@ -13185,6 +13245,10 @@ def build_upstream_body(payload):
     )
     if not messages or (messages[0].get("role") != "system"):
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+    messages, _trimmed, _estimated = trim_oversized_history(messages)
+    if _trimmed:
+        log("prompt trim: ~%d tokens over budget %d; dropped %d older message(s)"
+            % (_estimated, MAX_PROMPT_TOKENS, _trimmed))
     body = dict(payload)
     # Private request markers ride along on the chat body for the Responses
     # path (the namespace map, the local-web-tools flag). They are not part of
