@@ -14457,7 +14457,14 @@ def _free_model_credit_fallback_enabled():
 #   WB_HOLD_MAX_SECONDS=300     longest a request may be held
 #   WB_HOLD_POLL_SECONDS=15     re-poll interval while holding
 # ---------------------------------------------------------------------------
-CROSS_REALM_FAILOVER = os.environ.get("WB_CROSS_REALM_FAILOVER", "1").strip().lower() not in (
+# PATCHED-BY-OPS: default OFF. The only thing that sets a realm-wide hold is
+# note_account_restriction() on 403/11140, and the upstream post-mortem is
+# explicit that a 11140 means "stop using this device", not "switch account".
+# Borrowing the other exit there is the same device fingerprint with another
+# account - the pattern that got 7 accounts banned in one task (#422). The guard
+# below is now correct enough to fire; keeping it opt-in preserves the safer
+# behaviour that was previously reached by accident.
+CROSS_REALM_FAILOVER = os.environ.get("WB_CROSS_REALM_FAILOVER", "0").strip().lower() not in (
     "0", "false", "off", "no")
 HOLD_ON_NO_ACCOUNT = os.environ.get("WB_HOLD_ON_NO_ACCOUNT", "1").strip().lower() not in (
     "0", "false", "off", "no")
@@ -14658,7 +14665,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             log("model %s is cheaper on %s but that exit has no ready account; "
                 "staying on %s" % (model, _cheap, realm))
     hold = restriction_hold_remaining(realm)
-    if (hold > 0 and CROSS_REALM_FAILOVER and target_realm is None
+    # PATCHED-BY-OPS: this used to test `target_realm is None`, but every caller
+    # passes a realm (`req_realm = ... or CURRENT_REALM`), so the bypass could
+    # never fire and a wave-restricted exit failed fast even when the other exit
+    # was healthy. Match the same intent as CHEAPER_REALM: only an unpinned,
+    # default-exit request may borrow the other exit.
+    if (hold > 0 and CROSS_REALM_FAILOVER
+            and (target_realm or CURRENT_REALM) == CURRENT_REALM
             and POOL is not None and not model_realm_exclusive(model)):
         # PATCHED-BY-OPS: an upstream restriction is account/device scoped, so
         # the other exit is the only useful move. Serve this request from there
