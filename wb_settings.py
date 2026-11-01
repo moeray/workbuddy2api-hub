@@ -235,10 +235,44 @@ def settings_path(accounts_dir):
     return os.path.join(accounts_dir, "settings.json")
 
 
+class PanelPasswordCryptoError(RuntimeError):
+    """Raised when hashlib.pbkdf2_hmac is missing or fails due to interpreter environment issues."""
+    pass
+
+
+def check_pbkdf2_available():
+    """Verify hashlib.pbkdf2_hmac is functional in this interpreter.
+
+    Returns (ok: bool, reason: str).
+    """
+    if not hasattr(hashlib, "pbkdf2_hmac"):
+        return False, "module 'hashlib' has no attribute 'pbkdf2_hmac'"
+    try:
+        hashlib.pbkdf2_hmac("sha256", b"smoke", b"salt", 1)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
 def _digest(password, salt_hex, rounds=PBKDF2_ROUNDS):
-    return hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), rounds
-    ).hex()
+    if not hasattr(hashlib, "pbkdf2_hmac"):
+        raise PanelPasswordCryptoError(
+            "当前 Python 解释器缺少 hashlib.pbkdf2_hmac 支持，无法进行密码哈希计算。"
+            "若使用 Windows 便携版 Python，请检查系统安全策略（如 Smart App Control）是否拦截了 DLLs/_hashlib.pyd。"
+        )
+    try:
+        salt_bytes = bytes.fromhex(salt_hex)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"invalid password salt hex: {exc}") from exc
+    try:
+        return hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt_bytes, rounds
+        ).hex()
+    except (AttributeError, ImportError, ModuleNotFoundError, NotImplementedError, RuntimeError, OSError) as exc:
+        raise PanelPasswordCryptoError(
+            f"当前 Python 解释器计算 hashlib.pbkdf2_hmac 失败: {exc}。"
+            "若使用 Windows 便携版 Python，请检查系统安全策略（如 Smart App Control）是否拦截了 DLLs/_hashlib.pyd。"
+        ) from exc
 
 
 # settings.json 的解析结果按 (path, mtime, size) 缓存：请求热路径上它被读约 10
@@ -337,7 +371,9 @@ def verify_panel_password(accounts_dir, password):
     rounds = int(data.get("panel_password_rounds") or PBKDF2_ROUNDS)
     try:
         given = _digest(password, salt, rounds)
-    except Exception:
+    except PanelPasswordCryptoError:
+        raise
+    except ValueError:
         return False
     return hmac.compare_digest(given, stored)
 
@@ -399,7 +435,23 @@ def ensure_launcher_key(accounts_dir):
 # Each key can be bound to one upstream realm, so several clients can hit
 # different exits at the same time instead of sharing the global switch.
 
-REALMS = ("", "intl", "cn")
+REALMS = ("", "intl", "cn", "codearts")
+
+
+def codearts_config(accounts_dir):
+    """CodeArts 配置的薄包装，避免 wb_settings ↔ wb_codearts 的模块级循环。"""
+    import wb_codearts
+    return wb_codearts.load_config(accounts_dir)
+
+
+def set_codearts_config(accounts_dir, patch):
+    import wb_codearts
+    return wb_codearts.save_config(accounts_dir, patch)
+
+
+def codearts_configured(accounts_dir):
+    import wb_codearts
+    return wb_codearts.configured(accounts_dir)
 
 
 def _clean_model_patterns(value):
@@ -1575,6 +1627,21 @@ def set_upstream_config(accounts_dir, cfg):
     return clean
 
 
+def max_payload_mb(accounts_dir):
+    value = load(accounts_dir).get("max_payload_mb")
+    return value if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 256 else None
+
+
+def set_max_payload_mb(accounts_dir, value):
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 256:
+        raise ValueError("max_payload_mb must be an integer between 1 and 256")
+    with _lock:
+        data = load(accounts_dir)
+        data["max_payload_mb"] = value
+        save(accounts_dir, data)
+    return value
+
+
 USAGE_DEFAULTS = {
     "hour_keep_hours": 48,
     "day_keep_days": 32,
@@ -2386,6 +2453,7 @@ DAILY_CHAT_RANDOM_HOURS = (6, 11)
 DAILY_CHAT_RANDOM_MINUTES = (5, 55)
 DAILY_CHAT_RANDOM_KEY = "daily_chat_random"
 DAILY_CHAT_STARTUP_CATCHUP_KEY = "daily_chat_startup_catchup"
+DAILY_CHAT_WEB_FALLBACK_ACTIVITY_KEY = "daily_chat_web_fallback_activity"
 
 
 def _clean_models(value):
@@ -2550,6 +2618,32 @@ def set_daily_chat_startup_catchup(accounts_dir, enabled):
     with _lock:
         data = load(accounts_dir)
         data[DAILY_CHAT_STARTUP_CATCHUP_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def daily_chat_web_fallback_activity(accounts_dir):
+    """Whether a web-channel TLS failure falls back to the activity report.
+
+    Off unless the operator turns it on. The web channel is the only leg that
+    actually earns the daily reward, so its failure is reported as a failure -
+    otherwise the day looks done and the credits silently never arrive. The
+    exception is a certificate failure on the sandbox endpoint (#645): that is
+    an upstream/network configuration fault, retrying the same turn cannot
+    fix it, and leaving the whole day failed while the streak can be lit by a
+    plain POST /v2/report costs the operator the streak too. With this switch
+    on, a TLS failure on the web leg reports activity instead of failing the
+    round. Every other web failure keeps its old meaning.
+    """
+    return load(accounts_dir).get(DAILY_CHAT_WEB_FALLBACK_ACTIVITY_KEY) is True
+
+
+def set_daily_chat_web_fallback_activity(accounts_dir, enabled):
+    """Persist the web-leg fallback switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[DAILY_CHAT_WEB_FALLBACK_ACTIVITY_KEY] = enabled
         save(accounts_dir, data)
     return enabled
 

@@ -26,8 +26,10 @@ import io
 import ipaddress
 from collections import deque
 import re
+import atexit
 import json
 import os
+import queue
 import random
 # 单请求体上限。默认值从 50MB 收紧到 16MB，是「内存护栏」：body 先整体读成 bytes、
 # 再 decode 成 str、再 json.loads 成对象，实测 50MB body 的 decode+parse 峰值约
@@ -68,6 +70,7 @@ import wb_accounts
 import wb_activity
 import wb_atrest
 import wb_catalog
+import wb_codearts
 import wb_egress
 import wb_ipintel
 import wb_logstore
@@ -309,6 +312,10 @@ def install_console_close_handler():
                     sys.stdout.flush()
                 except Exception:
                     pass
+                try:
+                    flush_log_channel(0.5)   # 已入队的行尽力落盘，卡住也不拖延退出
+                except Exception:
+                    pass
                 os._exit(0)
             return False
         handler = PHANDLER_ROUTINE(_handler)   # keep the callback referenced
@@ -419,7 +426,8 @@ CORS_PATH_PREFIXES = ("/v1", "/chat", "/completions", "/models", "/responses")
 # Management paths that happen to live under /v1 must not be treated as API:
 # /v1/usage reports account-level spend and is gated by the panel session.
 MANAGEMENT_PATH_PREFIXES = ("/v1/usage", "/usage", "/accounts", "/settings",
-                            "/tasks", "/scheduler", "/panel", "/logs")
+                            "/tasks", "/scheduler", "/panel", "/logs",
+                            "/codearts")
 def cors_origin_allowed(path):
     """True when the OpenAI-style API path should advertise CORS."""
     path = (path or "").split("?")[0]
@@ -878,7 +886,7 @@ def _best_cached_tokens(usage):
 
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_ms=None, fp=None,
                 account=None, outcome="completed", key=None, effort=None,
-                requested_model=None):
+                requested_model=None, realm=None):
     """Record one finished request as exactly one JSONL row.
 
     A request without a usage block still gets a row (flagged usage_missing):
@@ -922,7 +930,7 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     if account:
         row["account"] = account
     acc = POOL.get(account) if (account and POOL) else None
-    row["realm"] = acc.realm if acc else CURRENT_REALM
+    row["realm"] = realm or (acc.realm if acc else CURRENT_REALM)
     # The refresher visits one account per tick, so on a large pool the cached
     # balance can be hours old; subtract this request's real cost at once so
     # reserve_credits keeps working between refreshes (#442).
@@ -936,7 +944,8 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     # The price policy this request is measured against, stored as a reference
     # so the table can be de-duplicated and swept. A row written before the
     # table existed has no reference and falls back to the timeline.
-    row["cost_policy"] = wb_pricing.current_policy_id(model)
+    row["cost_policy"] = ("codearts:unpriced" if realm == "codearts"
+                          else wb_pricing.current_policy_id(model))
     # Only when the request had one: the panel shows a chip for rows that carry
     # the field, and a model without reasoning controls has nothing to report.
     if effort:
@@ -985,9 +994,32 @@ def _persist_usage(row, fail_label):
     except Exception as exc:
         log("%s: %s" % (fail_label, exc))
 
+def upstream_failure_response(handler, model, exc, t_start, key_id=None):
+    """一次上游失败的统一出口：先定状态码，再落盘，最后回客户端。
+
+    池空（no usable account）是 **503**——等上游配额恢复，或者去面板加号；
+    其余是 **502**——查上游链路。顺序不能反：先记 502 再把响应改成 503，会
+    让日志与 `usage/usage.jsonl` 把"该等"记成"该查"，按状态码统计 5xx 时
+    两者混在一起（issue #666）。
+
+    两条链路（`/v1/responses`、`/v1/chat/completions`）原本各写一遍同样的
+    判断；收到这里后，状态码只有一个决定点，用量行与客户端看到的是同一个。
+    """
+    message = str(exc)
+    status = 503 if message.startswith("no usable account") else 502
+    record_error(model, status, message,
+                 elapsed_ms=int((time.time() - t_start) * 1000),
+                 account=getattr(exc, "account_uid", None),
+                 key=key_id)
+    if status == 503:
+        return handler._error(503, message +
+                              " - add or enable one at the dashboard (/)")
+    return handler._error(502, "upstream unreachable: %s" % exc)
+
+
 def record_error(model, status, message, elapsed_ms=None, account=None,
                  usage=None, stream=None, ttft_ms=None, gen_ms=None, fp=None,
-                 outcome="failed", key=None):
+                 outcome="failed", key=None, realm=None):
     """Record one failed request as exactly one JSONL row.
 
     Passing the account uid records which account the request was bound to, so
@@ -1027,10 +1059,13 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     row.update(fields)
     if fp:
         row.update(fp)
+    if realm:
+        row["realm"] = realm
     if account:
         row["account"] = account
         acc = POOL.get(account) if POOL else None
-        row["realm"] = acc.realm if acc else CURRENT_REALM
+        if not realm:
+            row["realm"] = acc.realm if acc else CURRENT_REALM
     row["key"] = key or ""
     _persist_usage(row, "error persist failed")
     dur = f" {elapsed_ms:.0f}ms" if elapsed_ms is not None else ""
@@ -2034,6 +2069,23 @@ def apply_daily_credit_limit(refresh=False):
         credits = stats["credits"] if stats is not None else None
         free_models = free_models_by_realm()
     return POOL.apply_daily_credit_limit(limits, credits, free_models)
+
+
+def apply_reserve_credits(refresh=False):
+    """Publish the reserve and, only when it is on, the realm free ids.
+
+    This reuses the existing 60-second local catalogue cache; it never folds
+    usage logs or adds network work. The settings-save path passes refresh=True
+    so switching the guard off also clears the in-memory threshold.
+    """
+    if POOL is None:
+        return 0
+    values = wb_settings.limit_values(ACCOUNTS_DIR, "reserve_credits")
+    on = any(value > 0 for value in values.values())
+    if not on and not refresh:
+        return values
+    return POOL.apply_reserve_credits(
+        values, free_models_by_realm() if on else None)
 
 
 def apply_model_daily_token_limit(refresh=False):
@@ -6058,6 +6110,42 @@ def realm_state_file():
     return os.path.join(ACCOUNTS_DIR, "active_realm.json")
 
 
+def _realm_selectable(realm):
+    """这个出口现在能不能被选中。
+
+    intl/cn 永远可用；codearts 只有配置完整时才可用，避免持久化了一个已经
+    被删掉/关闭的出口，进程起来后所有未绑定 Key 都打到 503。
+    """
+    if realm in ("intl", "cn"):
+        return True
+    if realm == "codearts":
+        try:
+            return wb_settings.codearts_configured(ACCOUNTS_DIR)
+        except Exception:
+            return False
+    return False
+
+
+def realm_options():
+    """看板/`/realm` 的出口选项。CodeArts 未配置时不出现在列表里。"""
+    options = ["intl", "cn"]
+    if _realm_selectable("codearts"):
+        options.append("codearts")
+    return options
+
+
+def reconcile_codearts_realm():
+    """CodeArts 被关闭/删配置后，把默认出口从 codearts 收敛回 intl。
+
+    返回 True 表示真的发生了收敛；调用方（设置保存）据此给看板带一条 warning。
+    """
+    if CURRENT_REALM == "codearts" and not _realm_selectable("codearts"):
+        save_persisted_realm("intl")
+        log("codearts realm disabled; default exit reset to intl")
+        return True
+    return False
+
+
 def load_persisted_realm():
     global CURRENT_REALM
     path = realm_state_file()
@@ -6066,7 +6154,11 @@ def load_persisted_realm():
             with open(path, "r", encoding="utf-8") as fh:
                 d = json.load(fh)
                 r = d.get("realm")
-                if r in ("intl", "cn"):
+                if r in ("intl", "cn", "codearts"):
+                    if r == "codearts" and not _realm_selectable(r):
+                        log("persisted realm 'codearts' is not configured; "
+                            "falling back to intl")
+                        return CURRENT_REALM
                     CURRENT_REALM = r
                     return CURRENT_REALM
         except Exception as e:
@@ -6074,7 +6166,9 @@ def load_persisted_realm():
     return CURRENT_REALM
 def save_persisted_realm(realm):
     global CURRENT_REALM
-    if realm in ("intl", "cn"):
+    if realm in ("intl", "cn", "codearts"):
+        if realm == "codearts" and not _realm_selectable(realm):
+            return CURRENT_REALM
         CURRENT_REALM = realm
         try:
             os.makedirs(ACCOUNTS_DIR, exist_ok=True)
@@ -6438,6 +6532,15 @@ def proxy_slots_view():
             slot_id = account.proxy_slot
             if slot_id and account.enabled:
                 counts[slot_id] = counts.get(slot_id, 0) + 1
+    try:
+        for account in wb_codearts.pool_for(ACCOUNTS_DIR).accounts:
+            slot_id = account.proxy_slot
+            if slot_id and not account.disabled:
+                counts[slot_id] = counts.get(slot_id, 0) + 1
+    except Exception:
+        # CodeArts is optional; a broken account file must not take down the
+        # WorkBuddy proxy-slot panel.
+        pass
     out = []
     for entry in wb_settings.proxy_slots(ACCOUNTS_DIR):
         item = dict(entry)
@@ -10212,6 +10315,7 @@ def runtime_settings_view():
         "models_only_available": wb_settings.models_only_available(ACCOUNTS_DIR),
         "identity": wb_settings.identity_config(ACCOUNTS_DIR),
         "identity_version_defaults": wb_identity.default_versions(),
+        "codearts": wb_codearts.masked_config(ACCOUNTS_DIR),
         "daily_chat_web": wb_settings.daily_chat_web(ACCOUNTS_DIR),
         "daily_chat_web_timeout":
             wb_settings.daily_chat_web_timeout(ACCOUNTS_DIR,
@@ -10240,6 +10344,8 @@ def runtime_settings_view():
         "daily_chat_budget_max": wb_settings.DAILY_CHAT_BUDGET_MAX,
         "daily_chat_startup_catchup":
             wb_settings.daily_chat_startup_catchup(ACCOUNTS_DIR),
+        "daily_chat_web_fallback_activity":
+            wb_settings.daily_chat_web_fallback_activity(ACCOUNTS_DIR),
         "local_web_tools": wb_settings.local_web_tools(ACCOUNTS_DIR),
         "remaining_priority_enabled":
             wb_settings.remaining_priority_enabled(ACCOUNTS_DIR),
@@ -10266,6 +10372,10 @@ def runtime_settings_view():
         "keep_backups": wb_settings.keep_backups(ACCOUNTS_DIR),
         "keep_backups_max": wb_settings.MAX_KEEP_BACKUPS,
         "upstream": wb_settings.upstream_config(ACCOUNTS_DIR),
+        "max_payload_mb": wb_settings.max_payload_mb(ACCOUNTS_DIR),
+        "max_payload_bytes_effective": (wb_settings.max_payload_mb(ACCOUNTS_DIR) * 1024 * 1024
+                                        if wb_settings.max_payload_mb(ACCOUNTS_DIR) is not None
+                                        else MAX_PAYLOAD_BYTES),
         "usage": wb_settings.usage_config(ACCOUNTS_DIR),
         "prompt": wb_settings.prompt_config(ACCOUNTS_DIR),
         "window_probe": wb_settings.window_probe(ACCOUNTS_DIR),
@@ -10275,7 +10385,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.7.33",
+        "version": "1.10.0",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -10611,16 +10721,129 @@ def add_log_entry(msg, level=None, tag=None):
         LOG_STORE.append(entry)
     return entry
 
-def log(msg, level=None, tag=None):
-    # 控制台 stderr 与看板 buffer 同源脱敏；写失败一律吞掉。
-    # 日志通道绝不能打死请求。send_response() 会先调 log_request()，所以 stderr 写
-    # 失败一旦抛出，异常发生在响应头发出之前：客户端只看到连接被掐、日志库里一条
-    # 不留，而 /health /realm /panel/status 因为在 log_message 静默白名单里照常
-    # 200，看起来"服务健在"（2026-10-19 线上网关的启动终端被回收后实测只剩这
-    # 三个端点能答，其余全部空响应）。
+# ---------------------------------------------------------------------------
+# stderr 日志通道：请求线程只入队，真正的 stderr 写入交给唯一的后台线程。
+#
+# #489 处理的是「写 stderr 会抛异常」（启动终端被回收 → OSError）。还有一种形态它
+# 盖不住：stderr 接到「有人建、没人读」的管道时，写满约 64KB 后 write() 会**永久
+# 阻塞且不抛异常**，try/except 拦不住。而 send_response() 会先调 log_request()，
+# 于是所有不在 log_message 静默白名单里的端点一起停摆，/health /realm /panel/status
+# 却照常 200 —— 外部看起来「服务健在、只有面板坏了」，实际请求线程全停在 log()。
+#
+# Request threads only enqueue; a single daemon thread owns stderr. If that write ever
+# blocks, only the writer parks: requests keep flowing and the queue drops lines (with a
+# counter surfaced through the panel log buffer) instead of wedging every endpoint.
+# ---------------------------------------------------------------------------
+_LOG_QUEUE_MAX = 2000
+_LOG_QUEUE = queue.Queue(maxsize=_LOG_QUEUE_MAX)
+_LOG_WRITER = None
+_LOG_WRITER_LOCK = threading.Lock()
+_LOG_DROPPED = 0
+_LOG_STREAM_CLOSED = False
+_LOG_SHUTTING_DOWN = False
+_LOG_ATEXIT_REGISTERED = False
+
+
+def _log_writer_loop():
+    """唯一的 stderr 写者：阻塞也只阻塞它自己（daemon，随进程退出）。"""
+    global _LOG_STREAM_CLOSED
+    while True:
+        line = _LOG_QUEUE.get()
+        try:
+            if line is None:
+                return
+            if _LOG_STREAM_CLOSED:
+                continue
+            stream = sys.stderr
+            if stream is None:
+                # pythonw / 无控制台时并不总是可写对象，别再逐行试
+                _LOG_STREAM_CLOSED = True
+                continue
+            try:
+                stream.write(line)
+                stream.flush()
+            except Exception:
+                # 读端消失 / 终端被回收：放弃控制台通道，buffer 与日志库照常
+                _LOG_STREAM_CLOSED = True
+        finally:
+            _LOG_QUEUE.task_done()
+
+
+def _ensure_log_writer():
+    global _LOG_WRITER, _LOG_ATEXIT_REGISTERED
+    writer = _LOG_WRITER
+    if writer is not None and writer.is_alive():
+        return writer
+    with _LOG_WRITER_LOCK:
+        if _LOG_WRITER is None or not _LOG_WRITER.is_alive():
+            worker = threading.Thread(target=_log_writer_loop, name="log-writer",
+                                      daemon=True)
+            worker.start()
+            _LOG_WRITER = worker
+            if not _LOG_ATEXIT_REGISTERED:
+                # 解释器退出前先让写线程收手。daemon 线程在 finalize 阶段还攥着
+                # stderr 的缓冲锁时，CPython 会以 `_enter_buffered_busy` 直接中止
+                # 进程 —— 套件里表现为「测试全 OK、退出码非零」，短命的 CLI 进程
+                # （例如 console_tail）也会踩到。实测：不加这一层，60 行日志后立刻
+                # 退出连续 6/6 次中止；加上后 10/10 干净退出。
+                atexit.register(_stop_log_writer)
+                _LOG_ATEXIT_REGISTERED = True
+    return _LOG_WRITER
+
+
+def _stop_log_writer(timeout=0.5):
+    """atexit：尽力写完已入队的行，再让写线程自己退出（不让它拖住 finalize）。"""
+    global _LOG_SHUTTING_DOWN
+    flush_log_channel(timeout)
+    _LOG_SHUTTING_DOWN = True
+    writer = _LOG_WRITER
+    if writer is None or not writer.is_alive():
+        return
     try:
-        sys.stderr.write(f"[wb-proxy] {time.strftime('%H:%M:%S')} {_mask_text(str(msg))}\n")
-        sys.stderr.flush()
+        _LOG_QUEUE.put_nowait(None)          # 叫醒它：写线程见到 None 就返回
+    except queue.Full:
+        pass                                 # 队列满＝它正卡在写里，join 会超时
+    try:
+        writer.join(max(0.05, float(timeout)))
+    except Exception:
+        pass
+
+
+def flush_log_channel(timeout=0.5):
+    """退出前尽力把已入队的行写完；写卡住时最多等 timeout 秒，绝不为日志拖延退出。
+
+    判据用 `unfinished_tasks`（入队 +1、写完 -1）而不是 `empty()`：写线程 `get()`
+    取下最后一行后队列就已经空了，但它可能还在 `write()` 里 —— 退出时漏掉那一行
+    的正是这个窗口。卡住的管道同样只让这里等到 timeout。
+    """
+    try:
+        deadline = time.time() + max(0.0, float(timeout))
+    except (TypeError, ValueError):
+        return
+    while time.time() < deadline:
+        if _LOG_STREAM_CLOSED or not _LOG_QUEUE.unfinished_tasks:
+            return
+        time.sleep(0.01)
+
+
+def log(msg, level=None, tag=None):
+    # 控制台 stderr 与看板 buffer 同源脱敏。写入交给后台线程（见 _log_writer_loop）：
+    # 队列满只丢行并计数，绝不在请求线程里阻塞，也绝不让日志通道打死请求。
+    global _LOG_DROPPED
+    if _LOG_SHUTTING_DOWN:
+        # 退出途中写线程已收手：只进 buffer / 日志库，不再往队列里放
+        add_log_entry(msg, level=level, tag=tag)
+        return
+    _ensure_log_writer()
+    line = f"[wb-proxy] {time.strftime('%H:%M:%S')} {_mask_text(str(msg))}\n"
+    try:
+        _LOG_QUEUE.put_nowait(line)
+    except queue.Full:
+        _LOG_DROPPED += 1
+        if _LOG_DROPPED == 1 or _LOG_DROPPED % 1000 == 0:
+            # 只进 buffer / 日志库，不再走 stderr：那条路已经堵住了
+            add_log_entry("stderr log channel is blocked; %d line(s) dropped so far"
+                          % _LOG_DROPPED, level="WARN", tag="system")
     except Exception:
         pass
     add_log_entry(msg, level=level, tag=tag)
@@ -11743,6 +11966,18 @@ SANITIZE_DSH_GUI_RE = re.compile(
     r" whose URL the runtime context names\.")
 SANITIZE_DSH_GUI_REPLACEMENT = r"\1 whose URL is named in the runtime context."
 SANITIZE_DSH_GUI_LOWER = "whose url the runtime context names"
+# 文件引用段（#683）：官方插件 @deepseek-ai/dsh-file-reference 注入的
+# FILE_REFERENCE_PROMPT 整段命中同一套「A 句 + B 句连续出现」判据，
+# 回 400 / code 11-128。实测（2026-10-28，CN 号池）：整段 5 句连排稳定 400，
+# 只发前两句 200 —— 匹配的是整段，不是单词。
+#
+# 修法只动 A 句一个词：`paths the user` -> `paths that the user`，语义不变，
+# 整段不再连续；负向前瞻 (?!that ) 保证幂等。作用域与 GUI 段一致：
+# system / developer / assistant，user / tool 里的同句属用户数据不改写（#537）。
+SANITIZE_DSH_FILEREF_RE = re.compile(
+    r"(?i)(Tokens prefixed with @ are paths )(?!that )(the user explicitly referenced\.)")
+SANITIZE_DSH_FILEREF_REPLACEMENT = r"\1that \2"
+SANITIZE_DSH_FILEREF_LOWER = "are paths the user explicitly referenced"
 # 品牌词缩减（#574）：`DeepSeek Harness` 单独出现放行，但它和 GUI 描述句
 # （`this page` / `this GUI` / `this app`）连续出现时命中同一套 11-128 校验。
 # 逐段二分实测：只把品牌缩成 `DeepSeek` 就能通过，句子其余部分不用动；
@@ -11800,6 +12035,10 @@ def has_fingerprint(text, identity=True):
     if (SANITIZE_DSH_GUI_LOWER in low
             and SANITIZE_DSH_GUI_RE.search(text) is not None):
         return True
+    # 文件引用段：同一条廉价前置探测，命中才走正则。
+    if (SANITIZE_DSH_FILEREF_LOWER in low
+            and SANITIZE_DSH_FILEREF_RE.search(text) is not None):
+        return True
     # 动词短语只是廉价前置筛：真命中与否交给正则判定。这样 "powered by" 出现在
     # 与自我介绍无关的句子（工具/插件的产品描述）时不会走进 sanitize_text 的其余
     # 清洗步骤，也不会白白改写。
@@ -11820,6 +12059,8 @@ def sanitize_text(text, identity=True):
         text = SANITIZE_IDENTITY_RE.sub(SANITIZE_IDENTITY_REPLACEMENT, text)
         # GUI 描述段单独一条规则：锚定整句，只调整句尾语序。
         text = SANITIZE_DSH_GUI_RE.sub(SANITIZE_DSH_GUI_REPLACEMENT, text)
+        # 文件引用段：只补一个词，打断整段连续匹配。
+        text = SANITIZE_DSH_FILEREF_RE.sub(SANITIZE_DSH_FILEREF_REPLACEMENT, text)
         # 品牌词缩减放在最后：GUI 规则还认全名，先让它匹配原文。
         text = SANITIZE_BRAND_RE.sub(SANITIZE_BRAND_REPLACEMENT, text)
     for old, new in SANITIZE_REWRITES:
@@ -13643,8 +13884,8 @@ def gateway_hint(status, message):
     text = str(message or "")
     lower = text.lower()
     if status == 413 and "payload too large" in lower:
-        return ("single request body exceeds the gateway cap "
-                "(WB_MAX_PAYLOAD_BYTES, default 16MB); raise it and restart wb-proxy")
+        return ("single request body exceeds the gateway cap; reduce the request or "
+                "increase the limit in panel settings (or WB_MAX_PAYLOAD_BYTES before startup)")
     if status == 503 and "concurrent chat limit" in lower:
         return "gateway is busy at its concurrency limit; retry shortly"
     if ("11133" in lower or "model_param_invalid" in lower
@@ -14000,7 +14241,10 @@ def read_http_error(exc, limit=600):
     if raw is not None:
         return raw[:limit]
     try:
-        return exc.read(limit)
+        raw = exc.read(limit)
+        if os.environ.get("WB_CACHE_HTTP_ERROR_BODY", "").strip().lower() in ("1", "true", "yes", "on"):
+            exc.wb_body = raw
+        return raw
     except Exception:
         return b""
 
@@ -14403,12 +14647,16 @@ def _apply_stream_idle_timeout(response, seconds):
         return False
 
 
-def schedule_window_probe(account, model, reset_at):
+def schedule_window_probe(account, model, reset_at, cap=False, cap_at=0.0):
     """把上游给出的重置时刻登记给窗口探针（wb_window_probe）。
 
     上游的额度窗口按首次请求起算，到点无人请求就不会开始新一轮，所以这个
     时刻要在后台被主动用掉，而不是只当作一段冷却。登记本身不能影响请求
     路径：任何异常都只写日志，本次 429 照常换号重试。
+
+    `cap` 说明这条窗口是上游 6004 判定额度用满；连同撞线时刻一起落盘，
+    于是**任何模型**（不只免费模型）重启后仍然知道"这是配额用尽、撞线于
+    何时"，面板不会把它误写成一次临时限流（issue #668）。
     """
     if not reset_at or account is None or not model:
         return False
@@ -14418,7 +14666,8 @@ def schedule_window_probe(account, model, reset_at):
     accounts_dir = getattr(POOL, "dir", "") or ACCOUNTS_DIR
     try:
         import wb_window_probe
-        return wb_window_probe.schedule(accounts_dir, account.uid, model, reset_at)
+        return wb_window_probe.schedule(accounts_dir, account.uid, model, reset_at,
+                                         cap=cap, cap_at=cap_at)
     except Exception as exc:
         log("window probe schedule failed: %s" % exc)
         return False
@@ -14617,6 +14866,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # share the same fold, and calling them separately paid for it three
     # times on every request.
     apply_daily_guards()
+    apply_reserve_credits()
     # 剩余用量优先调度（开关默认关）：把「估计剩余接近耗尽」的 (账号, 模型)
     # 权重推给池，让它们先接单。只在开关打开时读剩余估算（载荷有短 TTL，热路径
     # 上是缓存命中）；关着时推空表，把上一次可能留下的权重清掉，下一个请求就
@@ -15024,7 +15274,19 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                                    cooldown=wait, detail=detail)
                 # 除了记冷却，还要把重置时刻交给后台探针：到点主动发一个最小
                 # 请求，把新一轮窗口的计时起点钉在那一刻（窗口按首次请求起算）。
-                schedule_window_probe(account, model, reset_at)
+                #
+                # 「达到限额」的唯一标志是上游返回 6004（用户口径）：别的 429
+                # 即使带重置墙钟也不构成额度判定。这个事实跟窗口一起落盘，
+                # 于是**任何模型**（含国内版按积分计费的 deepseek-v4.1-flash）
+                # 都能保住"配额用尽 + 撞线时刻"，面板不会把它误写成一次临时
+                # 限流（issue #668）。凭证档的 model_caps 仍只覆盖免费模型：
+                # 那是限额联动的范围，与"这是不是配额用尽"是两件事。
+                is_cap = rate_limit_is_cap(detail)
+                cap_at = time.time() if is_cap else 0.0
+                if is_cap:
+                    account.model_cap_marks[model] = cap_at
+                schedule_window_probe(account, model, reset_at, cap=is_cap,
+                                      cap_at=cap_at)
                 if reset_at:
                     # A cap with a reset clock is the one observable moment the
                     # window budget can be measured from; the usage rows alone
@@ -15036,15 +15298,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     # 记录范围（免费模型）由 note_model_cap 把守——范围外的
                     # 模型返回 False，重启后自动放开，不参与持久化禁用。
                     #
-                    # PATCHED-BY-OPS: 上游给了「明确的恢复时刻」且距今超过 5
-                    # 分钟时，也按该模型上限停用这个账号。依据是观测到的实际
-                    # 损耗：账号 acf5bff3 在 ds4-flash 上额度耗尽后，因为 429
-                    # 不是 6004 形态，只拿到 60s 冷却，于是每次请求都先试它、
-                    # 撞一次 429、再切走（2 分钟内 3 次），每请求白付一次往返。
-                    # reset_at 是上游自己声明的恢复时间，按它停用不会过度；
-                    # 5 分钟以内的短时频率限制仍走原来的冷却，不写盘。
+                    # PATCHED-BY-OPS: 429 但 reset_at 还很远时同样按 cap 处理。
+                    # 观测过：某模型额度耗尽被判成 429 而不是 6004，只拿到 60s
+                    # 冷却，于是每两个请求就再撞一次 429，每次还换号重试。
+                    # reset_at 是上游自己给的恢复时刻，比 5 分钟阶梯可靠。
                     long_window = reset_at - time.time() > 300
-                    if rate_limit_is_cap(detail) or long_window:
+                    if is_cap or long_window:
                         try:
                             if account.note_model_cap(model, reset_at):
                                 _save_account_caps(account, model, reset_at)
@@ -15319,7 +15578,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         raise last_error
     throttled, wait = realm_model_throttled(realm, model)
     if throttled:
-        raise RateLimited(None, "usage exceeds frequency limit", wait=wait)
+        # 说清在等什么、等多久：客户端看到 "usage exceeds frequency limit"
+        # 时不知道是哪个模型、还有多久能好，于是照旧立刻重试（issue #665）。
+        reason = ("every usable account in realm '%s' is cooling the upstream %s "
+                  "window; the pool resumes in %ds" % (realm, model, wait))
+        raise RateLimited(None, "usage exceeds frequency limit", wait=wait,
+                          message=reason)
     enabled = [a for a in POOL.accounts
                if a.realm == realm and a.enabled and a.access_token] if POOL else []
     if enabled and all(a.daily_limit_blocked() for a in enabled):
@@ -15350,9 +15614,29 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                   "request(s) (account_max_concurrent=%d); retry shortly or "
                   "raise the cap" % (limit, limit))
         raise RateLimited(None, reason, wait=1, message=reason)
-    raise RuntimeError("no usable account for realm '%s': all are disabled, cooling down, "
-                       "expired or parked by the daily token limit%s"
-                       % (realm, pool_unavailable_detail(realm, model)))
+    candidates = [a for a in enabled
+                  if allowed_accounts is None or a.uid in allowed_accounts]
+    if (model and candidates
+            and all(a.blocked_by_model_cooldown(model) for a in candidates)):
+        # 全部候选都只差"这个模型的上游窗口恢复"：这是**等待**，不是故障。
+        # 503 + "去面板加号" 解决不了上游配额，只会让客户端立刻重试（真机
+        # 实测 24ms 一轮、3 分钟 12 次）；429 + Retry-After 才会让客户端等到
+        # 恢复时刻（issue #665）。
+        until = min(a.model_cooldown_until(model) for a in candidates)
+        wait = max(1, int(until - time.time()))
+        reason = ("every candidate account is waiting for the upstream %s window "
+                  "to reset (%d account(s), earliest reset in %ds); the pool is "
+                  "idle, not broken - retry after the reset"
+                  % (model, len(candidates), wait))
+        raise RateLimited(None, detail=reason, wait=wait, message=reason)
+    scope = ""
+    if allowed_accounts:
+        scope = ("; this API key may use %d account(s)" % len(allowed_accounts))
+    raise RuntimeError("no usable account for realm '%s': every candidate is "
+                       "disabled, cooling down, expired, out of upstream quota "
+                       "or parked by a local limit%s%s"
+                       % (realm, scope,
+                          pool_unavailable_detail(realm, model, allowed_accounts)))
 
 
 # ---- 跨出口回退：国际版 → 国内版（开关默认关）--------------------------------
@@ -15441,7 +15725,7 @@ def open_upstream_with_fallback(payload, session_key=None, target_realm=None,
     return open_upstream(payload, session_key=session_key,
                          target_realm=backup, **kwargs)
 
-def pool_unavailable_detail(realm, model=None):
+def pool_unavailable_detail(realm, model=None, allowed_accounts=None):
     """把该区域每个账号不可用的原因拼成一句，附在「没有可用账号」后面。
 
     这句话以前只列了四种可能（停用 / 冷却 / 过期 / 日限额），而 v1.6.16 之后
@@ -15451,11 +15735,20 @@ def pool_unavailable_detail(realm, model=None):
     排查的人只能对着「明明有 9 个账号」的池子猜。
 
     这里不改变判定，只把判定结果说出来：每个不可用账号「八位 UID + 原因」。
+
+    `allowed_accounts` 给定时只列**真正参与本次派发**的账号：API Key 可以
+    绑定账号，绑定之外的号再健康也轮不到。把它们列进来只会把排查的人引去
+    看整个区域——真机上就是这样：Key 绑的 2 个号在冷却，报错却列了全区 4 个
+    在冷却的号，而 2 个健康的号（没绑这个 Key）一个字都没提（issue #665）。
     """
     if POOL is None:
         return ""
     accounts = [a for a in POOL.accounts if a.realm == realm]
+    if allowed_accounts is not None:
+        accounts = [a for a in accounts if a.uid in allowed_accounts]
     if not accounts:
+        if allowed_accounts is not None:
+            return "；本 Key 绑定的账号都不在 %s 区" % realm
         return "；该区域没有任何账号"
     reasons = []
     for account in accounts:
@@ -15468,6 +15761,70 @@ def pool_unavailable_detail(realm, model=None):
     if not reasons:
         return ""
     return "；各账号：%s" % "，".join(reasons)
+
+
+def pool_readiness(pool=None, realm=None):
+    """账号池的可用口径：总数、按区域、按模型。
+
+    `/health` 以前只报两个数：全池的账号数与全池的"可用"数。它们既不按区域
+    分，也不看模型级冷却——被上游按 (账号, 模型) 限额挡住的号仍算"可用"。
+    于是池子对某个模型已经空了，探针与面板还是一片绿（issue #667）。
+
+    旧的 `accounts` / `accounts_ready` 保持原义（老脚本不受影响），这里补上
+    三种口径：按区域、按模型、当前出口的可用数。模型清单取自账号自己知道的
+    那些（免费模型名单、已撞线的模型、正在冷却的模型），不额外去打上游。
+    """
+    pool = POOL if pool is None else pool
+    out = {"accounts": 0, "accounts_ready": 0, "accounts_by_realm": {},
+           "accounts_ready_by_realm": {}, "accounts_ready_current_realm": 0,
+           "models_ready": {}}
+    if pool is None:
+        return out
+    accounts = list(pool.accounts)
+    realms = []
+    for a in accounts:
+        r = getattr(a, "realm", "") or ""
+        if r not in realms:
+            realms.append(r)
+    out["accounts"] = len(accounts)
+    out["accounts_ready"] = pool.count_ready()
+    for r in realms:
+        out["accounts_by_realm"][r] = len(
+            [a for a in accounts if (getattr(a, "realm", "") or "") == r])
+        out["accounts_ready_by_realm"][r] = pool.count_ready(realm=r)
+    out["accounts_ready_current_realm"] = pool.count_ready(
+        realm=realm or CURRENT_REALM)
+    models = set()
+    for a in accounts:
+        models.update(getattr(a, "free_models", ()) or ())
+        models.update(list((getattr(a, "model_caps", {}) or {}).keys()))
+        models.update(list((getattr(a, "model_cooldowns", {}) or {}).keys()))
+    for m in sorted(models)[:50]:
+        out["models_ready"][m] = {
+            r: pool.count_ready(realm=r, model=m, refresh=False) for r in realms}
+    return out
+
+
+def key_readiness(entry, pool=None):
+    """这个 API Key 真正能用到几个号（绑定 × 区域 × 当前状态）。
+
+    `/health` 报的是全池的数：池子里有号、服务在跑，但这个 Key 绑定的号可能
+    全在冷却里——"服务正常但我的 Key 用不了"就是这么发生的（issue #667）。
+    """
+    pool = POOL if pool is None else pool
+    out = {"key_accounts_ready": 0, "key_accounts_bound": 0}
+    if pool is None or not entry:
+        return out
+    allowed = wb_settings.key_allowed_accounts(entry)
+    realm = (entry or {}).get("realm") or CURRENT_REALM
+    out["key_accounts_ready"] = pool.count_ready(
+        realm=realm, allowed=allowed, refresh=False)
+    if allowed is not None:
+        out["key_accounts_bound"] = len(allowed)
+    else:
+        out["key_accounts_bound"] = len(
+            [a for a in pool.accounts if (getattr(a, "realm", "") or "") == realm])
+    return out
 
 #: 「测试」默认用哪条模型：最便宜、任何区域都有的那条。
 TEST_MODEL_DEFAULT = "deepseek-v4.1-flash"
@@ -15591,7 +15948,12 @@ def probe_account(account, model=None, timeout=30):
         # The label keeps its 80-char cut; `detail` rides along untouched so the
         # panel can show the whole upstream body on hover.
         row["status"] = exc.code
-        row["error"] = "HTTP %d: %s" % (exc.code, detail[:150])
+        # Keep the 401's WWW-Authenticate in the label: APISIX says
+        # error="invalid_token" there and serves an HTML body, so a body-only
+        # label reads like a proxy page and leaves the account parked in the
+        # pool while every dispatch bounces (#435's exemption is not meant to
+        # cover a gateway that names the credential as bad).
+        row["error"] = wb_accounts.http_error_message(exc, detail, 150)
         if exc.code == 403 and restriction_is_account_level(detail):
             # 测试也认账号级风控限制：不能用 60 秒的普通冷却把 2 小时覆盖掉，
             # 更不能用「测试通过」的语义把被限制的账号放回池子（见 #422）。
@@ -15602,7 +15964,7 @@ def probe_account(account, model=None, timeout=30):
             row["restricted"] = True
             row["fails"] = int(account.fails)
             return row
-        account.note_error("HTTP %d: %s" % (exc.code, detail[:80]),
+        account.note_error(wb_accounts.http_error_message(exc, detail, 80),
                            cooldown=60, detail=detail)
         row["fails"] = int(account.fails)
         return row
@@ -15781,9 +16143,12 @@ def aggregate_stream(raw_iter, model, resp_id):
     saw_done = False
     for line in iter_sse_lines(raw_iter):
         data = strip_data_prefix(line.decode("utf-8", "replace"))
-        if not data or data == "[DONE]":
-            if data == "[DONE]":
-                saw_done = True
+        if data == "[DONE]":
+            saw_done = True
+            if os.environ.get("WB_STOP_AT_SSE_DONE", "").strip().lower() in ("1", "true", "yes", "on"):
+                break
+            continue
+        if not data:
             continue
         try:
             chunk = json.loads(data)
@@ -18050,9 +18415,12 @@ def stream_responses_events(upstream, model, holder):
         yield ev("response.in_progress", {"response": resp_obj("in_progress")})
     for raw in upstream:
         data = strip_data_prefix(raw.decode("utf-8", "replace"))
-        if not data or data == "[DONE]":
-            if data == "[DONE]":
-                saw_done = True
+        if data == "[DONE]":
+            saw_done = True
+            if os.environ.get("WB_STOP_AT_SSE_DONE", "").strip().lower() in ("1", "true", "yes", "on"):
+                break
+            continue
+        if not data:
             continue
         try:
             chunk = json.loads(data)
@@ -18436,7 +18804,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.7.33"
+    server_version = "wb-proxy/1.10.0"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -18835,6 +19203,11 @@ class Handler(BaseHTTPRequestHandler):
         """
         if not realm or not model:
             return ""
+        if realm == "codearts":
+            # CodeArts 的模型名和 WorkBuddy 大量重叠（GLM-5.2、
+            # deepseek-v4-pro-0813…），按模型名猜出口在这里必然误判。出口已经
+            # 由 Key/面板显式选定，直接放行。
+            return ""
         owner = exclusive_realm(model)
         if not owner or owner == realm:
             return ""
@@ -18955,6 +19328,8 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if path.startswith("/agents"):
             return True
+        if path.startswith("/codearts"):
+            return True
         return False
     def _strip_pinned_prefix_only(self):
         """Strip /u/<ref> from self.path; returns False for a malformed ref."""
@@ -19017,6 +19392,9 @@ class Handler(BaseHTTPRequestHandler):
         # same wb_agents.py shipped in the repository, no secrets inside).
         if path == "/agents/cli":
             return self._get_agents_cli()
+        if path == "/oauth/callback":
+            # 华为云 OAuth 浏览器回调：不带面板会话，靠 ticket_id/secret 匹配会话。
+            return self._get_codearts_oauth_callback(query)
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
         if path in ("/", "/dashboard", "/ui"):
@@ -19029,6 +19407,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_health()
         if path == "/realm":
             return self._get_realm()
+        if path == "/codearts/overview":
+            return self._get_codearts_overview()
+        if path == "/codearts/accounts":
+            return self._get_codearts_accounts()
         if path == "/v1/balance-summary":
             return self._get_v1_balance_summary()
         if path in ("/v1/models", "/models"):
@@ -19100,11 +19482,15 @@ class Handler(BaseHTTPRequestHandler):
     def _get_panel_status(self):
         # Answer without a token: the dashboard needs to know whether to
         # show the login screen before it can hold a session.
+        crypto_ok, crypto_reason = wb_settings.check_pbkdf2_available()
         info = {
             "panel_password_required": True,
             "panel_password_is_default": wb_settings.panel_password_is_default(ACCOUNTS_DIR),
             "authenticated": self._panel_ok(),
+            "crypto_ok": crypto_ok,
         }
+        if not crypto_ok:
+            info["crypto_error"] = crypto_reason
         # Whether a key exists is not a secret; its value never leaves the
         # process, and the settings endpoint only reports a masked form.
         info["api_key_set"] = bool(API_KEY)
@@ -19131,6 +19517,10 @@ class Handler(BaseHTTPRequestHandler):
                 sys.stdout.flush()
             except Exception:
                 pass
+            try:
+                flush_log_channel(0.5)   # 已入队的行尽力落盘，卡住也不拖延退出
+            except Exception:
+                pass
             os._exit(0)
         threading.Thread(target=_bye, daemon=True).start()
         return self._json(200, {"ok": True, "shutting_down": True})
@@ -19139,15 +19529,32 @@ class Handler(BaseHTTPRequestHandler):
         # Always answer (the launcher uses this to detect a running copy),
         # but only expose account identity to an authorised caller.
         rep = current_account()
+        crypto_ok, crypto_reason = wb_settings.check_pbkdf2_available()
         info = {
             "ok": True,
             # Report the realm actually in use; this used to be the
             # literal "intl" and drifted from the panel switch.
             "realm": CURRENT_REALM,
-            "accounts": len(POOL.accounts) if POOL else 0,
-            "accounts_ready": POOL.count_ready() if POOL else 0,
-            "api_key_required": auth_required(),
+            "crypto_ok": crypto_ok,
         }
+        if not crypto_ok:
+            info["crypto_error"] = crypto_reason
+        # accounts / accounts_ready keep their old meaning (whole pool, any
+        # model); the per-realm and per-model counts say which combinations
+        # are actually servable (issue #667).
+        info.update(pool_readiness())
+        info["api_key_required"] = auth_required()
+        try:
+            cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+            codearts = {"configured": wb_codearts.configured_config(cfg),
+                        "base_url": wb_codearts.SNAP_HOST}
+            if codearts["configured"]:
+                codearts.update(wb_codearts.health(cfg))
+            info["codearts"] = codearts
+        except Exception as exc:
+            # CodeArts 只是子字段：它掉线不能把整体 /health 变红。
+            info["codearts"] = {"configured": False, "ok": False,
+                                "error": str(exc)[:200]}
         if self._key_ok():
             info.update({
                 "uid": rep.uid if rep else None,
@@ -19156,17 +19563,49 @@ class Handler(BaseHTTPRequestHandler):
                 "credential_file": os.path.basename(rep.path) if rep and rep.path else None,
                 "expires_at": rep.expires_at if rep else None,
             })
+            info.update(key_readiness(getattr(self, "key_entry", None)))
         return self._json(200, info)
     # Accept the conventional /v1 prefix and the bare path, because clients
     # differ in whether they append "/v1" themselves.
 
     def _get_realm(self):
-        return self._json(200, {"current": CURRENT_REALM, "options": ["intl", "cn"]})
+        options = realm_options()
+        if CURRENT_REALM not in options:
+            # 配置被删/关闭后，持久化的出口可能已经不在选项里。收敛到 intl，
+            # 否则看板会显示一个自己都解释不了的 current。
+            save_persisted_realm("intl")
+        return self._json(200, {"current": CURRENT_REALM, "options": options})
+
+    def _get_codearts_models(self):
+        """CodeArts 出口的模型目录：实时拉 codearts2api，失败回退缓存。"""
+        cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+        if not wb_codearts.configured_config(cfg):
+            return self._error(
+                503, "CodeArts 出口未启用：请到设置页填写 Base URL 和 API Key。",
+                "invalid_request_error")
+        try:
+            data = wb_codearts.model_entries(cfg)
+        except wb_codearts.CodeArtsAuthError as exc:
+            return self._error(502, str(exc), "invalid_request_error")
+        except wb_codearts.CodeArtsError as exc:
+            return self._error(502, str(exc), "invalid_request_error")
+        if wb_settings.filter_models_by_key(ACCOUNTS_DIR) and self.key_entry:
+            data = [m for m in data
+                    if wb_settings.key_allows_model(self.key_entry, m.get("id"))]
+        payload = {
+            "object": "list",
+            "data": data,
+            "realm": "codearts",
+            "catalog": wb_codearts.models_meta(cfg),
+        }
+        return self._json(200, payload)
 
     def _get_v1_models(self):
         if not self._authorized():
             return
         req_realm = self._request_realm() or CURRENT_REALM
+        if req_realm == "codearts":
+            return self._get_codearts_models()
         try:
             entries = fetch_models(realm=req_realm)
         except Exception as exc:
@@ -19706,8 +20145,10 @@ class Handler(BaseHTTPRequestHandler):
                 break
             total += size
             if total > max_bytes:
-                # Keep draining so the connection stays aligned, then refuse.
-                self._drain_chunked_body()
+                # The current chunk has not been read. Close rather than trying
+                # to parse its data as another chunk header or draining forever.
+                self.close_connection = True
+                self._body_consumed = True
                 raise BodyTooLarge(total)
             remaining = size
             while remaining > 0:
@@ -19760,11 +20201,15 @@ class Handler(BaseHTTPRequestHandler):
         return {}
     def _payload_or_error(self, allow_list=False):
         """Read the body, replying with the right error and returning None."""
+        configured_mb = wb_settings.max_payload_mb(ACCOUNTS_DIR)
+        limit = configured_mb * 1024 * 1024 if configured_mb is not None else MAX_PAYLOAD_BYTES
         try:
-            return self._read_payload(allow_list=allow_list)
+            return self._read_payload(max_bytes=limit, allow_list=allow_list)
         except BodyTooLarge as exc:
+            self.close_connection = True
+            self._body_consumed = True
             message = ("payload too large (%d bytes > %d limit)"
-                       % (exc.length, MAX_PAYLOAD_BYTES))
+                       % (exc.length, limit))
             if self._anthropic_route():
                 self._anthropic_error(413, message, "invalid_request_error")
             else:
@@ -19835,9 +20280,13 @@ class Handler(BaseHTTPRequestHandler):
                     realm = str(item.get("realm") or "").strip().lower()
                 else:
                     realm = str(stored.get("realm") or "").strip().lower()
-                if realm not in ("", "intl", "cn"):
-                    return self._error(400, "realm must be intl, cn or empty",
+                if realm not in wb_settings.REALMS:
+                    return self._error(400, "realm must be intl, cn, codearts or empty",
                                        "invalid_request_error")
+                if realm == "codearts" and not _realm_selectable("codearts"):
+                    return self._error(
+                        400, "codearts realm is not configured; enable it in settings first",
+                        "invalid_request_error")
                 # An older cached panel does not know this field at all, so a
                 # row that omits it keeps whatever is stored instead of
                 # silently dropping the restriction.
@@ -19943,8 +20392,8 @@ class Handler(BaseHTTPRequestHandler):
         if limits_payload is not None:
             reply["limits"] = wb_settings.limits_snapshot(ACCOUNTS_DIR)
         if touched:
-            if POOL and "reserve_credits" in touched:
-                POOL.apply_reserve_credits()
+            if "reserve_credits" in touched:
+                apply_reserve_credits(refresh=True)
             if any(k in touched for k in ("daily_token_limit", "daily_credit_limit",
                                           "model_daily_token_limit")):
                 # One pass refreshes all three: a limit edit is rare, and the
@@ -20117,7 +20566,12 @@ class Handler(BaseHTTPRequestHandler):
                 reply["identity_private_data"] = value
         if "identity_versions" in payload:
             password = payload.get("panel_password") or ""
-            if not wb_settings.verify_panel_password(ACCOUNTS_DIR, password):
+            try:
+                valid = wb_settings.verify_panel_password(ACCOUNTS_DIR, password)
+            except wb_settings.PanelPasswordCryptoError as exc:
+                log("panel      : crypto failure verifying password: %s" % exc)
+                return self._error(500, str(exc), "server_error")
+            if not valid:
                 return self._error(401, "invalid panel password",
                                    "invalid_request_error")
             raw = payload.get("identity_versions")
@@ -20250,6 +20704,14 @@ class Handler(BaseHTTPRequestHandler):
                     "invalid_request_error")
             wb_settings.set_daily_chat_startup_catchup(ACCOUNTS_DIR, raw)
             reply["daily_chat_startup_catchup"] = raw
+        if "daily_chat_web_fallback_activity" in payload:
+            raw = payload.get("daily_chat_web_fallback_activity")
+            if not isinstance(raw, bool):
+                return self._error(
+                    400, "daily_chat_web_fallback_activity must be true or false",
+                    "invalid_request_error")
+            wb_settings.set_daily_chat_web_fallback_activity(ACCOUNTS_DIR, raw)
+            reply["daily_chat_web_fallback_activity"] = raw
         if "local_web_tools" in payload:
             raw = payload.get("local_web_tools")
             if not isinstance(raw, bool):
@@ -20399,6 +20861,11 @@ class Handler(BaseHTTPRequestHandler):
             # The panel's hint promises this takes effect now: a lower value
             # has to drop the extra folders immediately, not at the next update.
             reply["pruned_backups"] = wb_update_request.apply_keep_backups(stored)
+        if "max_payload_mb" in payload:
+            try:
+                reply["max_payload_mb"] = wb_settings.set_max_payload_mb(ACCOUNTS_DIR, payload["max_payload_mb"])
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
         if "upstream" in payload:
             raw = payload.get("upstream")
             if not isinstance(raw, dict):
@@ -20458,6 +20925,21 @@ class Handler(BaseHTTPRequestHandler):
             wb_settings.set_quota_scan_models(ACCOUNTS_DIR, raw_models)
             reply["quota_scan_models_saved"] = len(
                 wb_settings.quota_scan_models(ACCOUNTS_DIR))
+        if "codearts" in payload:
+            raw = payload.get("codearts")
+            if not isinstance(raw, dict):
+                return self._error(400, "codearts must be an object",
+                                   "invalid_request_error")
+            try:
+                wb_codearts.save_config(ACCOUNTS_DIR, raw)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            wb_codearts.invalidate_models()
+            wb_codearts.invalidate_overview()
+            reply["codearts"] = wb_codearts.masked_config(ACCOUNTS_DIR)
+            if reconcile_codearts_realm():
+                reply["warning"] = ("CodeArts 出口已停用，默认出口已切回国际版；"
+                                    "绑定 CodeArts 的 Key 需要改绑后才能继续使用。")
         new_key = payload.get("api_key")
         if new_key is not None:
             new_key = str(new_key).strip()
@@ -20504,6 +20986,13 @@ class Handler(BaseHTTPRequestHandler):
                 if dropped:
                     log("proxy slots: unbound %d account(s) from removed slots"
                         % dropped)
+            try:
+                dropped_ca = wb_codearts.drop_missing_bindings(ACCOUNTS_DIR, saved)
+                if dropped_ca:
+                    log("proxy slots: unbound %d CodeArts account(s) from "
+                        "removed slots" % dropped_ca)
+            except Exception as exc:
+                log("proxy slots: CodeArts rebind failed: %s" % exc)
             log("proxy slots saved: %d slot(s)" % len(saved))
             return self._json(200, {"slots": proxy_slots_view()})
         if path == "/proxy/slots/test":
@@ -20882,7 +21371,12 @@ class Handler(BaseHTTPRequestHandler):
                     wait_sec = int(60 - (now - attempts[0]))
                     return self._error(429, f"too many login attempts, please wait {max(1, wait_sec)}s", "rate_limit_error")
             password = str(payload.get("password") or "")
-            if not wb_settings.verify_panel_password(ACCOUNTS_DIR, password):
+            try:
+                valid = wb_settings.verify_panel_password(ACCOUNTS_DIR, password)
+            except wb_settings.PanelPasswordCryptoError as exc:
+                log("panel      : crypto failure verifying password: %s" % exc)
+                return self._error(500, str(exc), "server_error")
+            if not valid:
                 with _login_lock:
                     _login_attempts.setdefault(client_ip, []).append(now)
                 # Small backoff delay to mitigate automated brute force
@@ -20905,11 +21399,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/panel/password":
             current = str(payload.get("current") or "")
             new = str(payload.get("new") or "")
-            if not wb_settings.verify_panel_password(ACCOUNTS_DIR, current):
+            try:
+                valid = wb_settings.verify_panel_password(ACCOUNTS_DIR, current)
+            except wb_settings.PanelPasswordCryptoError as exc:
+                log("panel      : crypto failure verifying current password: %s" % exc)
+                return self._error(500, str(exc), "server_error")
+            if not valid:
                 return self._error(401, "current password is wrong", "invalid_request_error")
             if len(new) < 4:
                 return self._error(400, "new password must be at least 4 characters", "invalid_request_error")
-            wb_settings.set_panel_password(ACCOUNTS_DIR, new)
+            try:
+                wb_settings.set_panel_password(ACCOUNTS_DIR, new)
+            except wb_settings.PanelPasswordCryptoError as exc:
+                log("panel      : crypto failure setting password: %s" % exc)
+                return self._error(500, str(exc), "server_error")
             log("panel      : password changed")
             if new != wb_settings.DEFAULT_PANEL_PASSWORD:
                 # Rotating the password invalidates every other browser session.
@@ -20921,8 +21424,145 @@ class Handler(BaseHTTPRequestHandler):
                     new == wb_settings.DEFAULT_PANEL_PASSWORD,
             })
         return self._error(404, "not found", "invalid_request_error")
+    def _get_codearts_oauth_callback(self, query):
+        cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+        try:
+            status, html = wb_codearts.oauth_callback_get(cfg, query)
+        except Exception as exc:
+            status, html = 400, "<h3>登录失败：%s</h3>" % exc
+        raw = ("<!doctype html><meta charset=\"utf-8\"><body style=\"font-family:sans-serif;"
+               "padding:32px;line-height:1.7\">" + html + "</body>").encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _get_codearts_overview(self):
+        cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+        if not wb_codearts.configured_config(cfg):
+            return self._error(
+                503, "CodeArts 出口未启用：请到设置页填写 Base URL 和 API Key。",
+                "invalid_request_error")
+        try:
+            data = wb_codearts.overview(cfg)
+        except wb_codearts.CodeArtsError as exc:
+            return self._error(502, str(exc), "invalid_request_error")
+        out = dict(data)
+        health = wb_codearts.health(cfg)
+        out["online"] = health["ok"]
+        out["health"] = health
+        out["base_url"] = wb_codearts.SNAP_HOST
+        return self._json(200, out)
+
+    def _get_codearts_accounts(self):
+        cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+        if not wb_codearts.configured_config(cfg):
+            return self._error(
+                503, "CodeArts 出口未启用：请到设置页填写 Base URL 和 API Key。",
+                "invalid_request_error")
+        try:
+            data = wb_codearts.overview(cfg)
+        except wb_codearts.CodeArtsError as exc:
+            return self._error(502, str(exc), "invalid_request_error")
+        return self._json(200, {
+            "provider": "codearts",
+            "accounts": data.get("accounts") or [],
+            "stats": data.get("stats") or {},
+            "models": data.get("models") or [],
+            "base_url": wb_codearts.SNAP_HOST,
+        })
+
+    def _codearts_admin_error(self, exc):
+        if isinstance(exc, wb_codearts.CodeArtsNotFound):
+            message = str(exc)
+            if "account not found" in message.lower():
+                return self._error(404, message, "invalid_request_error")
+            return self._error(
+                409, "codearts2api 版本过旧，没有删除账号接口；请升级 apps/codearts 后重建容器。",
+                "invalid_request_error")
+        if isinstance(exc, wb_codearts.CodeArtsBadRequest):
+            return self._error(400, str(exc), "invalid_request_error")
+        return self._error(502, str(exc), "invalid_request_error")
+
+    def _handle_codearts(self, path, payload):
+        """`/codearts/*` 管理代理：只接受面板会话。"""
+        if not self._panel_ok():
+            return self._error(401, "panel password required",
+                               "invalid_request_error")
+        if not isinstance(payload, dict):
+            return self._error(400, "expected a JSON object",
+                               "invalid_request_error")
+        cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+        if not wb_codearts.configured_config(cfg):
+            return self._error(
+                503, "CodeArts 出口未启用：请到设置页填写 Base URL 和 API Key。",
+                "invalid_request_error")
+        uid = str(payload.get("uid") or "").strip()
+        try:
+            if path == "/codearts/test":
+                health = wb_codearts.health(cfg, force=True)
+                if not health.get("ok"):
+                    return self._json(502, {"ok": False, "health": health})
+                data = wb_codearts.overview(cfg, force=True)
+                return self._json(200, {
+                    "ok": True, "health": health,
+                    "stats": data.get("stats") or {},
+                    "models": len(data.get("models") or []),
+                })
+            if path == "/codearts/accounts/oauth/start":
+                try:
+                    port = int(self.server.server_address[1])
+                except Exception:
+                    port = 8788
+                return self._json(200, wb_codearts.oauth_start(cfg, port))
+            if path == "/codearts/accounts/oauth/poll":
+                return self._json(200, wb_codearts.oauth_poll(
+                    cfg, payload.get("session_id")))
+            if path == "/codearts/accounts/oauth/callback":
+                return self._json(200, wb_codearts.oauth_callback(
+                    cfg, payload.get("session_id"),
+                    payload.get("callback_url")))
+            if path == "/codearts/keepalive":
+                result = wb_codearts.keepalive(cfg)
+                wb_codearts.invalidate_overview()
+                return self._json(200, result)
+            if path == "/codearts/models/refresh":
+                return self._json(200, wb_codearts.refresh_models(cfg))
+            if path == "/codearts/accounts/checkin":
+                # uid 可空：空 = 全员签到。
+                result = wb_codearts.checkin(cfg, uid)
+                wb_codearts.invalidate_overview()
+                return self._json(200, result)
+            if not uid:
+                return self._error(400, "uid required", "invalid_request_error")
+            if path == "/codearts/accounts/proxy":
+                result = wb_codearts.set_proxy_slot(
+                    cfg, uid, payload.get("slot_id"))
+            elif path == "/codearts/accounts/enable":
+                result = wb_codearts.enable(cfg, uid)
+            elif path == "/codearts/accounts/disable":
+                result = wb_codearts.disable(cfg, uid, payload.get("reason") or "")
+            elif path == "/codearts/accounts/delete":
+                result = wb_codearts.remove(cfg, uid)
+            elif path == "/codearts/accounts/clear-cooldown":
+                result = wb_codearts.clear_cooldown(cfg, uid)
+            else:
+                return self._error(404, "unknown codearts endpoint",
+                                   "invalid_request_error")
+            wb_codearts.invalidate_overview()
+            return self._json(200, result)
+        except wb_codearts.CodeArtsError as exc:
+            return self._codearts_admin_error(exc)
+
     def _handle_accounts(self, path, payload):
         """Account-management endpoints (dashboard uses these)."""
+        if path.startswith("/codearts"):
+            return self._handle_codearts(path, payload)
+        if path == "/realm":
+            # 默认出口切换不依赖账号池：池子不可用时仍然要能把出口改回来。
+            return self._route_realm(payload)
         if POOL is None:
             return self._error(503, "account pool unavailable")
         if path == "/accounts/import" and isinstance(payload, list):
@@ -20951,8 +21591,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_pricing_refresh(payload)
         if path == "/logs/clear":
             return self._route_logs_clear(payload)
-        if path == "/realm":
-            return self._route_realm(payload)
         if path == "/accounts/checkin":
             return self._route_accounts_checkin(payload)
         if path == "/accounts/daily-chat":
@@ -21384,8 +22022,14 @@ class Handler(BaseHTTPRequestHandler):
                                     "panel session, not an API key",
                                "invalid_request_error")
         new_realm = payload.get("realm")
-        if new_realm in ("intl", "cn"):
-            save_persisted_realm(new_realm)
+        if new_realm not in ("intl", "cn", "codearts"):
+            return self._error(400, "realm must be intl, cn or codearts",
+                               "invalid_request_error")
+        if new_realm == "codearts" and not _realm_selectable("codearts"):
+            return self._error(
+                400, "codearts realm is not configured; enable it in settings first",
+                "invalid_request_error")
+        save_persisted_realm(new_realm)
         return self._json(200, {"ok": True, "current": CURRENT_REALM, "persisted": True})
 
     def _route_accounts_checkin(self, payload):
@@ -21909,6 +22553,10 @@ class Handler(BaseHTTPRequestHandler):
             key_blocked = self._key_model_error(chat_req.get("model"))
             if key_blocked:
                 return self._error(400, key_blocked, "invalid_request_error")
+            if req_realm == "codearts":
+                return self._handle_codearts_responses(
+                    chat_req, session_key, model, want_stream, compaction,
+                    custom_names, request_meta, ns_map, fp, t_start)
             upstream, account, effort = open_upstream_with_fallback(
                 chat_req, session_key=session_key, target_realm=req_realm,
                 allow_realm_fallback=not explicit_realm,
@@ -21952,15 +22600,8 @@ class Handler(BaseHTTPRequestHandler):
                          key=self._key_id())
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
         except Exception as exc:
-            message = str(exc)
-            record_error(model, 502, message,
-                         elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None),
-                         key=self._key_id())
-            if message.startswith("no usable account"):
-                return self._error(503, message +
-                                   " - add or enable one at the dashboard (/)")
-            return self._error(502, f"upstream unreachable: {exc}")
+            return upstream_failure_response(self, model, exc, t_start,
+                                             self._key_id())
         with upstream:
             if compaction:
                 return self._responses_compaction_response(
@@ -22124,7 +22765,7 @@ class Handler(BaseHTTPRequestHandler):
             record_upstream_usage(upstream, model, holder.get("usage"), stream=True, elapsed_ms=wall,
                          ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, account=account.uid,
+                         fp=fp, account=account.uid, realm=realm,
                          outcome="client_aborted", key=self._key_id(), effort=effort)
             return
         except Exception as exc:
@@ -22134,7 +22775,8 @@ class Handler(BaseHTTPRequestHandler):
                          usage=holder.get("usage"), stream=True,
                          ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, outcome="upstream_aborted", key=self._key_id())
+                         fp=fp, outcome="upstream_aborted", realm=realm,
+                         key=self._key_id())
             try:
                 self.wfile.write(responses_stream_error_frame(
                     "upstream stream aborted: %s" % exc))
@@ -22153,11 +22795,12 @@ class Handler(BaseHTTPRequestHandler):
         record_upstream_usage(upstream, model, holder.get("usage"), stream=True, elapsed_ms=wall,
                      ttft_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, account=account.uid, key=self._key_id(), effort=effort,
+                     fp=fp, account=account.uid, realm=realm,
+                     key=self._key_id(), effort=effort,
                      outcome=("failed" if holder.get("empty_reasoning") else "completed"))
         return
 
-    def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None):
+    def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None, allow_web_tools=True):
         # 跟串流那条一样：客户端宣告 web_search / web_fetch 时由反代代跑。
         # 中间那几轮对客户端不可见，最后才组成一个 Responses 物件回传；不这样
         # 做的话 web_search 的 function_call 会直接漏给客户端，客户端只会回
@@ -22165,14 +22808,15 @@ class Handler(BaseHTTPRequestHandler):
         sources = []
         rounds = 0
         # 开关关闭时不拦同名呼叫：那是客户端自己的工具。
-        web_tools = web_tools_active(base_body)
+        # CodeArts 出口没有 wb-hub 的 web_search/web_fetch 代跑，调用方传 False。
+        web_tools = web_tools_active(base_body) if allow_web_tools else False
         while True:
             try:
                 chat_obj = aggregate_stream(upstream, model, None)
             except Exception as exc:
                 record_error(model, 502, str(exc),
                              elapsed_ms=int((time.time() - t_start) * 1000),
-                             account=account.uid, key=self._key_id())
+                             account=account.uid, realm=realm, key=self._key_id())
                 return self._error(502, f"upstream stream error: {exc}")
             calls = internal_calls_from_chat(chat_obj, web_tools=web_tools)
             if not calls:
@@ -22193,7 +22837,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 record_error(model, 502, "web tool follow-up failed: %s" % exc,
                              elapsed_ms=int((time.time() - t_start) * 1000),
-                             account=account.uid, key=self._key_id())
+                             account=account.uid, realm=realm, key=self._key_id())
                 return self._error(502, "web tool follow-up failed: %s" % exc)
             sources = holder.get("web_sources") or sources
         wall = int((time.time() - t_start) * 1000)
@@ -22203,11 +22847,13 @@ class Handler(BaseHTTPRequestHandler):
             record_error(model, 502, "upstream returned reasoning without output text",
                          elapsed_ms=wall, account=account.uid,
                          usage=chat_obj.get("usage"), stream=False,
-                         fp=fp, outcome="empty_reasoning", key=self._key_id())
+                         fp=fp, outcome="empty_reasoning", realm=realm,
+                         key=self._key_id())
             return self._error(
                 502, "upstream returned reasoning without output text; retry")
         record_upstream_usage(upstream, model, chat_obj.get("usage"), stream=False, elapsed_ms=wall, fp=fp,
-                     account=account.uid, key=self._key_id(), effort=effort)
+                     account=account.uid, realm=realm, key=self._key_id(),
+                     effort=effort)
         return self._json(200, result)
 
     def _handle_messages_count_tokens(self, payload):
@@ -22262,6 +22908,9 @@ class Handler(BaseHTTPRequestHandler):
             key_blocked = self._key_model_error(chat_req.get("model"))
             if key_blocked:
                 return self._anthropic_error(400, key_blocked, "invalid_request_error")
+            if req_realm == "codearts":
+                return self._handle_codearts_messages(
+                    chat_req, session_key, model, want_stream, fp, t_start)
             upstream, account, effort = open_upstream_with_fallback(
                 chat_req, session_key=session_key, target_realm=req_realm,
                 allow_realm_fallback=not explicit_realm,
@@ -22340,12 +22989,14 @@ class Handler(BaseHTTPRequestHandler):
             result = chat_to_messages(chat_obj)
             wall = int((time.time() - t_start) * 1000)
             record_upstream_usage(upstream, model, chat_obj.get("usage"), stream=False, elapsed_ms=wall,
-                         fp=fp, account=account.uid, key=self._key_id(), effort=effort)
+                         fp=fp, account=account.uid, realm=realm,
+                         key=self._key_id(), effort=effort)
             return self._json(200, result)
         except Exception as exc:
             wall = int((time.time() - t_start) * 1000)
             record_error(model, 502, "messages upstream error: %s" % exc,
-                         elapsed_ms=wall, account=account.uid, key=self._key_id())
+                         elapsed_ms=wall, account=account.uid, realm=realm,
+                         key=self._key_id())
             return self._anthropic_error(502, "upstream stream error: %s" % exc)
         finally:
             try:
@@ -22378,7 +23029,7 @@ class Handler(BaseHTTPRequestHandler):
             record_upstream_usage(upstream, model, holder.get("usage"), stream=True, elapsed_ms=wall,
                          ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, account=account.uid,
+                         fp=fp, account=account.uid, realm=realm,
                          outcome="client_aborted", key=self._key_id(), effort=effort)
             return
         except Exception as exc:
@@ -22387,7 +23038,7 @@ class Handler(BaseHTTPRequestHandler):
                          elapsed_ms=wall, account=account.uid,
                          usage=holder.get("usage"), stream=True,
                          ttft_ms=first_ms, fp=fp, outcome="upstream_aborted",
-                         key=self._key_id())
+                         realm=realm, key=self._key_id())
             try:
                 heartbeat.write(anthropic_sse_frame("error", {
                     "error": {"type": "api_error", "message": str(exc)}}))
@@ -22403,7 +23054,8 @@ class Handler(BaseHTTPRequestHandler):
         record_upstream_usage(upstream, model, holder.get("usage"), stream=True, elapsed_ms=wall,
                      ttft_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, account=account.uid, key=self._key_id(), effort=effort)
+                     fp=fp, account=account.uid, realm=realm,
+                     key=self._key_id(), effort=effort)
         return
 
     def do_POST(self):
@@ -22532,6 +23184,7 @@ class Handler(BaseHTTPRequestHandler):
             or path.startswith("/tasks")
             or path.startswith("/scheduler")
             or path.startswith("/logs")
+            or path.startswith("/codearts")
         )
         if not is_account_route and not is_messages_route and path not in (
                 "/v1/chat/completions", "/chat/completions",
@@ -22624,6 +23277,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_responses(payload)
         # Diagnostics: what the client actually asked for, and what we forward.
         # Only the knobs that change behaviour are logged - never message text.
+        session_key = extract_session_key(self.headers, payload)
+        want_stream = bool(payload.get("stream"))
+        model = payload.get("model") or "hy4-preview"
+        t_start = time.time()
+        explicit_realm = self._request_realm()
+        req_realm = explicit_realm or CURRENT_REALM
+        # PATCHED-BY-OPS: 模型所属区域与请求区域不一致时自动纠正（与 responses
+        # 路径同一套逻辑）。必须放在 codearts 分流之前，否则模型属于 codearts
+        # 时会被当成 cn/intl 继续往下走。
+        if MODEL_REALM_ROUTING and not explicit_realm:
+            _owner = exclusive_realm(payload.get("model"))
+            if _owner and _owner != req_realm:
+                log("model %s is %s-only; auto-routing this request to %s"
+                    % (payload.get("model"), _owner, _owner))
+                req_realm = _owner
+        if req_realm == "codearts":
+            blocked = self._banned_model_error(payload.get("model")) or self._key_model_error(payload.get("model"))
+            if blocked:
+                return self._error(400, blocked, "invalid_request_error")
+            # CodeArts 不走 WorkBuddy 的 build_upstream_body / 账号池：请求体、
+            # 超时、错误映射都由 wb_codearts 负责，回程复用下面的处理器。
+            return self._handle_codearts_chat(payload, session_key, req_realm)
         forwarded = build_upstream_body(payload)
         given = client_effort_of(payload) or payload.get("reasoning") \
             or payload.get("thinking") or payload.get("enable_thinking")
@@ -22638,21 +23313,8 @@ class Handler(BaseHTTPRequestHandler):
                 key_label(self._key_id()) or "-",
             )
         )
-        session_key = extract_session_key(self.headers, payload)
         fp = prompt_fingerprint(forwarded.get("messages"))
-        want_stream = bool(payload.get("stream"))
-        model = payload.get("model") or "hy4-preview"
-        t_start = time.time()
         try:
-            explicit_realm = self._request_realm()
-            req_realm = explicit_realm or CURRENT_REALM
-            # PATCHED-BY-OPS: same auto-routing as the responses path
-            if MODEL_REALM_ROUTING and not explicit_realm:
-                _owner = exclusive_realm(payload.get("model"))
-                if _owner and _owner != req_realm:
-                    log("model %s is %s-only; auto-routing this request to %s"
-                        % (payload.get("model"), _owner, _owner))
-                    req_realm = _owner
             blocked = self._cross_realm_error(payload.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -22706,16 +23368,10 @@ class Handler(BaseHTTPRequestHandler):
                          key=self._key_id())
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
         except Exception as exc:
-            message = str(exc)
-            record_error(model, 502, message, elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=getattr(exc, "account_uid", None),
-                         key=self._key_id())
-            if message.startswith("no usable account"):
-                # Only a genuinely empty/cooling pool is a 503. A throttled model
-                # is reported as 429 by _rate_limited above instead.
-                return self._error(503, message +
-                                   " - add or enable one at the dashboard (/)")
-            return self._error(502, f"upstream unreachable: {exc}")
+            # Only a genuinely empty/cooling pool is a 503. A throttled model
+            # is reported as 429 by _rate_limited above instead.
+            return upstream_failure_response(self, model, exc, t_start,
+                                             self._key_id())
         with upstream:
             def reopen_stream():
                 # Same account, same egress: only the TCP connection is new.
@@ -22731,8 +23387,116 @@ class Handler(BaseHTTPRequestHandler):
             return self._chat_nonstream_response(
                 upstream, model, fp, account, t_start, effort=effort)
 
+    def _open_codearts_chat(self, payload, session_key):
+        """选号并打开 CodeArts 的 SSE 上游；返回 (stream, account, model)。"""
+        cfg = wb_codearts.load_config(ACCOUNTS_DIR)
+        if not wb_codearts.configured_config(cfg):
+            # 本地配置问题，按 400 回：502 会让人以为上游坏了。
+            raise wb_codearts.CodeArtsBadRequest(
+                "CodeArts 出口未启用：请到设置页打开「启用 CodeArts 出口」。")
+        body = wb_codearts.build_chat_body(payload, session_key)
+        stream, account, model = wb_codearts.open_chat(
+            cfg, body, session_key, allowed_accounts=self._key_allowed_accounts())
+        return stream, account, model
+
+    def _codearts_error(self, model, exc, t_start, realm):
+        """把 CodeArts 异常落一条用量行，再回一个可读的 OpenAI 错误。"""
+        elapsed = int((time.time() - t_start) * 1000)
+        if isinstance(exc, wb_codearts.CodeArtsBadRequest):
+            status = 400
+        elif isinstance(exc, wb_codearts.CodeArtsAuthError):
+            status = 502
+        elif isinstance(exc, wb_codearts.CodeArtsNotFound):
+            status = 409
+        elif isinstance(exc, wb_codearts.CodeArtsConflict):
+            status = 409
+        else:
+            status = 502
+        record_error(model, status, str(exc)[:200], elapsed_ms=elapsed,
+                     realm=realm, key=self._key_id())
+        return self._error(status, str(exc), "invalid_request_error")
+
+    def _handle_codearts_chat(self, payload, session_key, realm):
+        """`/v1/chat/completions` 的 CodeArts 分支。"""
+        model = payload.get("model") or "glm-5.2"
+        want_stream = bool(payload.get("stream"))
+        t_start = time.time()
+        fp = prompt_fingerprint(payload.get("messages"))
+        try:
+            upstream, account, billed_model = self._open_codearts_chat(
+                payload, session_key)
+        except wb_codearts.CodeArtsError as exc:
+            return self._codearts_error(model, exc, t_start, realm)
+        log("codearts chat: model=%s stream=%s msgs=%d key=%s"
+            % (billed_model or model, want_stream,
+               len(payload.get("messages") or []),
+               key_label(self._key_id()) or "-"))
+        with upstream:
+            if want_stream:
+                return self._chat_stream_response(
+                    upstream, model, fp, account, t_start, realm=realm)
+            return self._chat_nonstream_response(
+                upstream, model, fp, account, t_start, realm=realm)
+
+    def _handle_codearts_responses(self, chat_req, session_key, model, want_stream,
+                                   compaction, custom_names, request_meta, ns_map,
+                                   fp, t_start):
+        """`/v1/responses` 的 CodeArts 分支。"""
+        try:
+            upstream, account, effort = self._open_codearts_chat(
+                chat_req, session_key)
+        except wb_codearts.CodeArtsError as exc:
+            return self._codearts_error(model, exc, t_start, "codearts")
+        with upstream:
+            if compaction:
+                return self._responses_compaction_response(
+                    upstream, model, fp, account, t_start, want_stream,
+                    session_key=session_key, realm="codearts")
+            if want_stream:
+                return self._responses_stream_response(
+                    upstream, model, custom_names, request_meta, fp, account,
+                    t_start, ns_map, base_body=chat_req, session_key=session_key,
+                    realm="codearts", effort=effort)
+            return self._responses_nonstream_response(
+                upstream, model, custom_names, request_meta, fp, account,
+                t_start, ns_map, base_body=chat_req, session_key=session_key,
+                realm="codearts", effort=effort, allow_web_tools=False)
+
+    def _codearts_anthropic_error(self, model, exc, t_start, realm):
+        if isinstance(exc, wb_codearts.CodeArtsBadRequest):
+            status, etype = 400, "invalid_request_error"
+        elif isinstance(exc, (wb_codearts.CodeArtsNotFound,
+                              wb_codearts.CodeArtsConflict)):
+            status, etype = 409, "invalid_request_error"
+        elif isinstance(exc, wb_codearts.CodeArtsError) and exc.status == 429:
+            status, etype = 429, "rate_limit_error"
+        else:
+            status, etype = 502, "api_error"
+        record_error(model, status, str(exc)[:200],
+                     elapsed_ms=int((time.time() - t_start) * 1000),
+                     realm=realm, key=self._key_id())
+        return self._anthropic_error(status, str(exc), etype)
+
+    def _handle_codearts_messages(self, chat_req, session_key, model, want_stream,
+                                  fp, t_start):
+        """Anthropic Messages 的 CodeArts 分支。"""
+        try:
+            upstream, account, effort = self._open_codearts_chat(
+                chat_req, session_key)
+        except wb_codearts.CodeArtsError as exc:
+            return self._codearts_anthropic_error(model, exc, t_start, "codearts")
+        with upstream:
+            if want_stream:
+                return self._messages_stream_response(
+                    upstream, model, fp, account, t_start, base_body=chat_req,
+                    session_key=session_key, realm="codearts", effort=effort)
+            return self._messages_nonstream_response(
+                upstream, model, fp, account, t_start, base_body=chat_req,
+                session_key=session_key, realm="codearts", effort=effort)
+
     def _chat_stream_response(self, upstream, model, fp, account, t_start, effort=None,
-                              reopen=None, headers_sent=False, retried=False):
+                              reopen=None, headers_sent=False, retried=False,
+                              realm=None):
             if not headers_sent:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -22768,7 +23532,8 @@ class Handler(BaseHTTPRequestHandler):
             egress_key = None
             if egress_on:
                 egress_key = wb_upstream_pool.egress_key(
-                    account.chat_base_url() + CHAT_PATH, account.proxy)
+                    account.chat_base_url() + getattr(account, "chat_path", CHAT_PATH),
+                account.proxy)
 
             def flush_out():
                 if out_buf:
@@ -22800,7 +23565,11 @@ class Handler(BaseHTTPRequestHandler):
                 with heartbeat:
                     for line in iter_sse_lines(upstream, before_read=before_read):
                         data = strip_data_prefix(line.decode("utf-8", "replace"))
-                        if not data or data == "[DONE]" or data.startswith(":"):
+                        if data == "[DONE]":
+                            if os.environ.get("WB_STOP_AT_SSE_DONE", "").strip().lower() in ("1", "true", "yes", "on"):
+                                break
+                            continue
+                        if not data or data.startswith(":"):
                             continue
                         maybe = None
                         try:
@@ -22874,7 +23643,7 @@ class Handler(BaseHTTPRequestHandler):
                 record_upstream_usage(upstream, model, last_usage, stream=True,
                              elapsed_ms=wall, ttft_ms=first_ms,
                              gen_ms=(wall - first_ms) if first_ms is not None else None,
-                             fp=fp, account=account.uid,
+                             fp=fp, account=account.uid, realm=realm,
                              outcome="client_aborted", key=self._key_id(), effort=effort)
                 return
             except Exception as exc:
@@ -22903,7 +23672,7 @@ class Handler(BaseHTTPRequestHandler):
                             return self._chat_stream_response(
                                 new_upstream, model, fp, new_account, t_start,
                                 effort=new_effort, reopen=None,
-                                headers_sent=True, retried=True)
+                                headers_sent=True, retried=True, realm=realm)
                         finally:
                             try:
                                 new_upstream.close()
@@ -22914,7 +23683,8 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=wall, account=account.uid,
                              usage=last_usage, stream=True, ttft_ms=first_ms,
                              gen_ms=(wall - first_ms) if first_ms is not None else None,
-                             fp=fp, outcome="upstream_aborted", key=self._key_id())
+                             fp=fp, outcome="upstream_aborted", realm=realm,
+                             key=self._key_id())
                 try:
                     release(leak_filter.flush())
                     if out_buf:
@@ -22948,27 +23718,30 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=wall, account=account.uid,
                              usage=last_usage, stream=True, ttft_ms=first_ms,
                              gen_ms=(wall - first_ms) if first_ms is not None else None,
-                             fp=fp, outcome="failed", key=self._key_id())
+                             fp=fp, outcome="failed", realm=realm, key=self._key_id())
             else:
                 record_upstream_usage(upstream, model, last_usage, stream=True,
                              elapsed_ms=wall, ttft_ms=first_ms,
                              gen_ms=(wall - first_ms) if first_ms is not None else None,
-                             fp=fp, account=account.uid, key=self._key_id(), effort=effort)
+                             fp=fp, account=account.uid, realm=realm,
+                             key=self._key_id(), effort=effort)
             return
 
-    def _chat_nonstream_response(self, upstream, model, fp, account, t_start, effort=None):
+    def _chat_nonstream_response(self, upstream, model, fp, account, t_start, effort=None,
+                                 realm=None):
         egress_on = wb_settings.egress_backoff_enabled(ACCOUNTS_DIR)
         egress_key = None
         if egress_on:
             egress_key = wb_upstream_pool.egress_key(
-                account.chat_base_url() + CHAT_PATH, account.proxy)
+                account.chat_base_url() + getattr(account, "chat_path", CHAT_PATH),
+                account.proxy)
         try:
             result = aggregate_stream(upstream, model, None)
         except Exception as exc:
             if egress_on and egress_key:
                 wb_egress.note_transient(egress_key)
             record_error(model, 502, str(exc), elapsed_ms=int((time.time() - t_start) * 1000),
-                         account=account.uid, key=self._key_id())
+                         account=account.uid, realm=realm, key=self._key_id())
             return self._error(502, f"upstream stream error: {exc}")
         if egress_on and egress_key:
             wb_egress.note_success(egress_key)
@@ -22979,7 +23752,8 @@ class Handler(BaseHTTPRequestHandler):
         record_upstream_usage(upstream, model, result.get("usage"), stream=False,
                      elapsed_ms=wall, ttft_ms=first_ms,
                      gen_ms=(wall - first_ms) if first_ms is not None else None,
-                     fp=fp, account=account.uid, key=self._key_id(), effort=effort)
+                     fp=fp, account=account.uid, realm=realm,
+                     key=self._key_id(), effort=effort)
         return self._json(200, result)
 
 # ---------------------------------------------------------------------------
@@ -23178,15 +23952,25 @@ def _bootstrap_runtime(args):
     if key_from_panel and not args.api_key:
         API_KEY = saved_key
         API_KEY_FILE_SET = True
+    crypto_ok, crypto_reason = wb_settings.check_pbkdf2_available()
+    if not crypto_ok:
+        log("WARN: Python 解释器缺少 hashlib.pbkdf2_hmac 支持 (%s)" % crypto_reason)
+        log("WARN: 若使用 Windows 便携版 Python，请检查系统安全策略（如 Smart App Control）是否拦截了 DLLs/_hashlib.pyd")
+        if not wb_settings.panel_password_is_default(ACCOUNTS_DIR):
+            log("WARN: 已检测到非默认面板密码，当前环境下将无法登录面板！")
     if args.panel_password:
-        wb_settings.set_panel_password(ACCOUNTS_DIR, args.panel_password)
-        log("panel      : password set from --panel-password")
+        try:
+            wb_settings.set_panel_password(ACCOUNTS_DIR, args.panel_password)
+            log("panel      : password set from --panel-password")
+        except wb_settings.PanelPasswordCryptoError as exc:
+            log("panel      : failed to set password from --panel-password: %s" % exc)
+            raise SystemExit("Cannot start: the requested panel password could not be set.") from exc
     elif wb_settings.panel_password_is_default(ACCOUNTS_DIR):
         log("panel      : password is still the default 'admin' - change it in the panel")
     POOL = wb_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
     POOL.apply_proxy_slots()
-    POOL.apply_reserve_credits()
+    apply_reserve_credits()
     # WB_MAX_CONCURRENT_CHAT=auto: size the chat ceiling from the pool that was
     # just loaded. Runs before the listener exists, so no request can hold a
     # slot yet and the semaphore swap is safe.
