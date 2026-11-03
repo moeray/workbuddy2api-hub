@@ -11003,6 +11003,12 @@ def merge_reasoning(base, live):
         out.setdefault("defaultEffort", out["effort"])
         out.pop("effort", None)
     return out
+# realm -> set of ids present in the live /v3/config data.models array.
+# curated_live_sources() fills this right before merge_catalog() runs, so the
+# bundled snapshot can be checked against what upstream actually publishes now.
+_official_ids_by_realm = {}
+
+
 def merge_catalog(primary, realm=None, extras=False):
     r = realm or CURRENT_REALM
     merged = {}
@@ -11014,8 +11020,17 @@ def merge_catalog(primary, realm=None, extras=False):
     else:
         source_static = getattr(wb_catalog, "STATIC_CN_MODELS" if r == "cn" else "STATIC_INTL_MODELS", wb_catalog.STATIC_MODELS)
     primary_ids = set(m for m, _ in (primary or []))
+    official = _official_ids_by_realm.get(r)
     for item in source_static:
         mid = item.get("id")
+        # Bundled entries that still claim to be free but no longer exist in the
+        # live official data.models are stale: they leak old x0.00 credits into
+        # /v1/models and into free_models_by_realm() (the daily credit guard).
+        # Only free-marked ones are dropped - other static rows are still useful
+        # as capability metadata for ids the CLI list omits.
+        if (official is not None and mid not in official
+                and credits_is_free(item.get("credits"))):
+            continue
         if mid == "hy4-preview-f" and "hy4-preview" in primary_ids and "hy4-preview-f" not in primary_ids:
             continue
         if mid and is_chat_model(mid) and mid not in merged:
@@ -11763,11 +11778,13 @@ def curated_live_sources(realm):
         log("remote catalog: %s failed (%s)" % (realm, exc))
     if remote:
         ids, meta = remote
+        _official_ids_by_realm[realm] = set(meta or {})
         return ([(mid, meta.get(mid) or {})
                 for mid in curate_remote_catalog(realm, ids, meta)], True, "remote")
     cached = read_cached_remote_catalog(realm)
     if cached:
         ids, meta = cached
+        _official_ids_by_realm[realm] = set(meta or {})
         return ([(mid, meta.get(mid) or {})
                 for mid in curate_remote_catalog(realm, ids, meta)], True, "cache")
     legacy = read_product_config_models(realm=realm)
