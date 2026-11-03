@@ -11359,6 +11359,14 @@ def remote_config_headers(account, realm, ua=None):
     # 静态 API Key 必须额外带 X-API-Key：只发 Authorization 时上游下发 54 条
     # 而不是 56 条，且 HTTP 仍是 200、没有任何提示（实测）。少的四条正是
     # glm-5.2-aicc / glm-5.3-flashx / kimi-k3-2 / minimax-m3-pay。
+    # Enterprise identities get a much larger catalogue from /v3/config
+    # (35 cli models vs 16).  wb_accounts already sends these two headers on
+    # chat requests; without them the config call is treated as a personal
+    # account and every enterprise-only model (e.g. hy4dev) disappears.
+    ent = str(getattr(account, "enterprise_id", "") or "").strip()
+    if ent:
+        headers["X-Enterprise-Id"] = ent
+        headers["X-Tenant-Id"] = ent
     if getattr(account, "is_api_key", False):
         headers["X-API-Key"] = account.access_token
     return headers
@@ -11499,6 +11507,28 @@ def curate_remote_catalog(realm, ids, meta=None):
     return out
 
 
+def _catalog_account(realm):
+    """Account used for the product-config call.
+
+    POOL.representative() simply returns the first account with a token.  Here
+    that is a disabled personal account, so the enterprise-only part of the
+    catalogue never shows up.  Prefer an enabled enterprise account; keep the
+    old representative as a fallback so realms without one behave as before.
+    """
+    if POOL is None:
+        return None
+    try:
+        candidates = [a for a in POOL.accounts
+                      if (not realm or a.realm == realm)
+                      and a.access_token and getattr(a, "enabled", True)]
+    except Exception:
+        return POOL.representative(realm=realm)
+    for a in candidates:
+        if getattr(a, "enterprise_id", ""):
+            return a
+    return candidates[0] if candidates else POOL.representative(realm=realm)
+
+
 def fetch_remote_product_config(realm):
     """(ids, meta) from the realm's own product-config endpoint, or None.
 
@@ -11509,7 +11539,7 @@ def fetch_remote_product_config(realm):
     """
     if realm not in ("intl", "cn") or POOL is None:
         return None
-    account = POOL.representative(realm=realm)
+    account = _catalog_account(realm)
     if account is None or not account.access_token:
         log("remote catalog: no usable %s account, skipping" % realm)
         return None
